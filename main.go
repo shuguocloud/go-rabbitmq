@@ -4,8 +4,8 @@ import (
     "log"
     "time"
 
-    "github.com/shuguocloud/rabbitmq-go/rabbitmq/consumer"
-    "github.com/shuguocloud/rabbitmq-go/rabbitmq/producer"
+    "github.com/shuguocloud/go-rabbitmq/rabbitmq/consumer"
+    "github.com/shuguocloud/go-rabbitmq/rabbitmq/producer"
     "github.com/streadway/amqp"
 )
 

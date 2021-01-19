@@ -1,4 +1,4 @@
-module github.com/shuguocloud/rabbitmq-go
+module github.com/shuguocloud/go-rabbitmq
 
 go 1.14
 
