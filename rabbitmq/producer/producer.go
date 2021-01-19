@@ -1,7 +1,6 @@
 package producer
 
 import (
-    "bytes"
     "errors"
     "log"
     "os"
@@ -62,8 +61,8 @@ func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool
     return &producer
 }
 
-// 首次連接rabbitmq，有錯即返回
-// 沒有遇錯，則開啟goroutine循環檢查是否斷線
+// 首次连接rabbitmq，有错即返回
+// 沒有遇错，则开启goroutine循环检查是否断线
 func (p *Producer) Start() error {
     if err := p.connect(); err != nil {
         return err
@@ -73,7 +72,7 @@ func (p *Producer) Start() error {
     return nil
 }
 
-// 連接conn and channel，根據bindingMode連接exchange and queue
+// 连接conn and channel，根据bindingMode连接exchange and queue
 func (p *Producer) connect() (err error) {
     p.logger.Println("attempt to connect rabbitmq")
     if p.conn, err = amqp.Dial(p.addr); err != nil {
@@ -214,7 +213,7 @@ func (p *Producer) reconnect() {
 // 当push失败，则wait resend time，在重新push
 // 累积resendTimes则返回error
 // push成功，检查有无回传confirm，沒有也代表push失败，并wait resend time，在重新push
-func (p *Producer) Push(data *bytes.Buffer) error {
+func (p *Producer) Push(data []byte) error {
     if !p.isConnected {
         p.logger.Println(errNotConnected.Error())
     }
@@ -229,7 +228,7 @@ func (p *Producer) Push(data *bytes.Buffer) error {
                 Headers:         p.headers,
                 ContentType:     "application/json",
                 ContentEncoding: "",
-                Body:            data.Bytes(),
+                Body:            data,
                 DeliveryMode:    amqp.Persistent, // 1=non-persistent, 2=persistent
                 Priority:        0,               // 0-9
                 Timestamp:       time.Now(),

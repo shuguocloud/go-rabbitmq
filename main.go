@@ -1,7 +1,6 @@
 package main
 
 import (
-    "bytes"
     "log"
     "time"
 
@@ -12,11 +11,10 @@ import (
 
 func main() {
 
-	headers := make(amqp.Table)
-	headers["test.topic"] = "platformData"
+    headers := make(amqp.Table)
+    headers["test.topic"] = "platformData"
 
     go func() {
-
 
         p := producer.New(
             "amqp://guest:guest@localhost:5672/",
@@ -32,8 +30,8 @@ func main() {
         }
         for {
             // msg := bytes.NewBufferString("hello")
-            msg := bytes.NewBuffer([]byte("hello"))
-            if err := p.Push(msg); err != nil {
+            //msg := bytes.NewBuffer([]byte("hello"))
+            if err := p.Push([]byte("hello")); err != nil {
                 // error handle
             }
             // 方便看log
