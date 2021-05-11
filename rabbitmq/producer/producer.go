@@ -36,6 +36,7 @@ type Producer struct {
     exchangeType string
     queue        string
     routerKey    string
+    contentType  string
     // true means auto create exchange and queue
     // false means passive create exchange and queue
     bindingMode bool
@@ -45,7 +46,7 @@ type Producer struct {
     logger *log.Logger
 }
 
-func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool, headers amqp.Table) *Producer {
+func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool, headers amqp.Table, contentType string) *Producer {
     producer := Producer{
         addr:         addr,
         exchange:     exchange,
@@ -54,6 +55,7 @@ func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool
         routerKey:    routerKey,
         bindingMode:  bindingMode,
         headers:      headers,
+        contentType:  contentType,
         logger:       log.New(os.Stdout, "", log.LstdFlags),
         done:         make(chan bool),
     }
@@ -226,7 +228,7 @@ func (p *Producer) Push(data []byte) error {
             false,       // Immediate
             amqp.Publishing{
                 Headers:         p.headers,
-                ContentType:     "application/json",
+                ContentType:     p.contentType,
                 ContentEncoding: "",
                 Body:            data,
                 DeliveryMode:    amqp.Persistent, // 1=non-persistent, 2=persistent
