@@ -76,7 +76,7 @@ func (p *Producer) Start() error {
 
 // 连接conn and channel，根据bindingMode连接exchange and queue
 func (p *Producer) connect() (err error) {
-    p.logger.Println("attempt to connect rabbitmq")
+    p.logger.Println("[go-rabbitmq] attempt to connect rabbitmq.")
     if p.conn, err = amqp.Dial(p.addr); err != nil {
         return err
     }
@@ -102,7 +102,7 @@ func (p *Producer) connect() (err error) {
     p.channel.NotifyClose(p.notifyClose)
     p.channel.NotifyPublish(p.notifyConfirm)
 
-    p.logger.Println("rabbitmq is connected")
+    p.logger.Println("[go-rabbitmq] rabbitmq is connected.")
 
     return nil
 }
@@ -199,13 +199,13 @@ func (p *Producer) reconnect() {
         case <-p.done:
             return
         case <-p.notifyClose:
-
+            p.logger.Println("[go-rabbitmq] rabbitmq notify close!")
         }
 
         p.isConnected = false
         for !p.isConnected {
             if err := p.connect(); err != nil {
-                p.logger.Println("failed to connect rabbitmq. Retrying...")
+                p.logger.Printf("[go-rabbitmq] failed to connect rabbitmq [err=%s]. Retrying...", err.Error())
                 time.Sleep(reconnectDelay)
             }
         }
@@ -236,7 +236,7 @@ func (p *Producer) Push(data []byte) error {
                 Timestamp:       time.Now(),
             },
         ); err != nil {
-            p.logger.Println("push failed. retrying...")
+            p.logger.Println("[go-rabbitmq] push failed. retrying...")
             currentTimes += 1
             if currentTimes < resendTimes {
                 time.Sleep(reconnectDelay)
@@ -250,12 +250,12 @@ func (p *Producer) Push(data []byte) error {
         select {
         case confirm := <-p.notifyConfirm:
             if confirm.Ack {
-                p.logger.Println("push confirmed!")
+                p.logger.Println("[go-rabbitmq] push confirmed!")
                 return nil
             }
         case <-ticker.C:
         }
-        p.logger.Println("push didn't confirm. retrying...")
+        p.logger.Println("[go-rabbitmq] push didn't confirm. retrying...")
     }
 }
 

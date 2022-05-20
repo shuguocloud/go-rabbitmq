@@ -71,7 +71,7 @@ func (c *Consumer) Start() error {
 
 // 连接conn and channel，根据bindingMode连接exchange and queue
 func (c *Consumer) connect() (err error) {
-    c.logger.Println("attempt to connect rabbitmq")
+    c.logger.Println("[go-rabbitmq] attempt to connect rabbitmq.")
     if c.conn, err = amqp.Dial(c.addr); err != nil {
         return err
     }
@@ -93,7 +93,7 @@ func (c *Consumer) connect() (err error) {
     c.isConnected = true
     c.notifyClose = make(chan *amqp.Error)
     c.channel.NotifyClose(c.notifyClose)
-    c.logger.Println("rabbitmq is connected")
+    c.logger.Println("[go-rabbitmq] rabbitmq is connected.")
 
     return nil
 }
@@ -191,7 +191,7 @@ func (c *Consumer) reconnect() {
         case <-c.done:
             return
         case <-c.notifyClose:
-            c.logger.Println("rabbitmq notify close!")
+            c.logger.Println("[go-rabbitmq] rabbitmq notify close!")
         }
 
         c.isConnected = false
@@ -199,7 +199,7 @@ func (c *Consumer) reconnect() {
         for {
             if !c.isConnected {
                 if err := c.connect(); err != nil {
-                    c.logger.Println("failed to connect rabbitmq. Retrying...")
+                    c.logger.Printf("[go-rabbitmq] failed to connect rabbitmq [err=%s]. Retrying...", err.Error())
                     time.Sleep(reconnectDelay)
                 }
             }
@@ -207,7 +207,7 @@ func (c *Consumer) reconnect() {
             // 避免连线马上断线的风险
             if c.isConnected && !c.isConsume {
                 if err := c.Consume(); err != nil {
-                    c.logger.Println("failed to consume rabbitmq. Retrying...")
+                    c.logger.Println("[go-rabbitmq] failed to consume rabbitmq. Retrying...")
                     time.Sleep(reconnectDelay)
                 } else {
                     break
@@ -219,7 +219,7 @@ func (c *Consumer) reconnect() {
 
 // 开启消費
 func (c *Consumer) Consume() (err error) {
-    c.logger.Println("attempt to consume rabbitmq.")
+    c.logger.Println("[go-rabbitmq] attempt to consume rabbitmq.")
     var delivery <-chan amqp.Delivery
     if delivery, err = c.channel.Consume(
         c.queue,
@@ -236,7 +236,7 @@ func (c *Consumer) Consume() (err error) {
     }
 
     c.isConsume = true
-    c.logger.Println("rabbitmq is consuming")
+    c.logger.Println("[go-rabbitmq] rabbitmq is consuming.")
     go c.handle(delivery)
     return nil
 }
@@ -245,10 +245,10 @@ func (c *Consumer) Consume() (err error) {
 func (c *Consumer) handle(delivery <-chan amqp.Delivery) {
     for d := range delivery {
         if err := c.handler(d.Body); err == nil {
-            c.logger.Println("consume success!")
+            c.logger.Println("[go-rabbitmq] consume success!")
             d.Ack(false)
         } else {
-            c.logger.Println("some consume problem for data:", err.Error())
+            c.logger.Println("[go-rabbitmq] some consume problem for data:", err.Error())
             d.Ack(false)
         }
     }
