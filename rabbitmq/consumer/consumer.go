@@ -71,12 +71,17 @@ func (c *Consumer) Start() error {
 
 // 连接conn and channel，根据bindingMode连接exchange and queue
 func (c *Consumer) connect() (err error) {
+    // 建立连接
     c.logger.Println("[go-rabbitmq] attempt to connect rabbitmq.")
     if c.conn, err = amqp.Dial(c.addr); err != nil {
+        c.logger.Println("[go-rabbitmq] failed to connect to rabbitmq:", err.Error())
         return err
     }
+
+    // 创建一个Channel
     if c.channel, err = c.conn.Channel(); err != nil {
         c.conn.Close()
+        c.logger.Println("[go-rabbitmq] failed to open a channel:", err.Error())
         return err
     }
 
@@ -100,6 +105,7 @@ func (c *Consumer) connect() (err error) {
 
 // 自动创建(如果有则覆盖)exchange、queue，并绑定queue
 func (c *Consumer) activeBinding() (err error) {
+    // 声明exchange
     if err = c.channel.ExchangeDeclare(
         c.exchange,
         c.exchangeType,
@@ -111,9 +117,11 @@ func (c *Consumer) activeBinding() (err error) {
     ); err != nil {
         c.conn.Close()
         c.channel.Close()
+        c.logger.Println("[go-rabbitmq] failed to declare a exchange:", err.Error())
         return err
     }
 
+    // 声明一个queue
     if _, err = c.channel.QueueDeclare(
         c.queue,
         true,  // Durable
@@ -124,8 +132,11 @@ func (c *Consumer) activeBinding() (err error) {
     ); err != nil {
         c.conn.Close()
         c.channel.Close()
+        c.logger.Println("[go-rabbitmq] failed to declare a queue:", err.Error())
         return err
     }
+
+    // exchange 绑定 queue
     if err = c.channel.QueueBind(
         c.queue,
         c.routerKey,
@@ -135,6 +146,7 @@ func (c *Consumer) activeBinding() (err error) {
     ); err != nil {
         c.conn.Close()
         c.channel.Close()
+        c.logger.Println("[go-rabbitmq] failed to bind a queue:", err.Error())
         return err
     }
 
@@ -144,6 +156,7 @@ func (c *Consumer) activeBinding() (err error) {
 // 检查exchange及queue是否存在，若不存在，則直接返回错误
 // 存在则绑定exchange及queue
 func (c *Consumer) passiveBinding() (err error) {
+    // 声明exchange
     if err = c.channel.ExchangeDeclarePassive(
         c.exchange,
         c.exchangeType,
@@ -154,6 +167,7 @@ func (c *Consumer) passiveBinding() (err error) {
         nil,
     ); err != nil {
         c.conn.Close()
+        c.logger.Println("[go-rabbitmq] failed to declare a exchange:", err.Error())
         return err
     }
 
@@ -166,6 +180,7 @@ func (c *Consumer) passiveBinding() (err error) {
         nil,   // Arguments
     ); err != nil {
         c.conn.Close()
+        c.logger.Println("[go-rabbitmq] failed to declare a queue:", err.Error())
         return err
     }
     if err = c.channel.QueueBind(
@@ -177,6 +192,7 @@ func (c *Consumer) passiveBinding() (err error) {
     ); err != nil {
         c.conn.Close()
         c.channel.Close()
+        c.logger.Println("[go-rabbitmq] failed to bind a queue:", err.Error())
         return err
     }
 
@@ -230,8 +246,9 @@ func (c *Consumer) Consume() (err error) {
         false,
         nil,
     ); err != nil {
-        c.channel.Close()
         c.conn.Close()
+        c.channel.Close()
+        c.logger.Println("[go-rabbitmq] consume failed:", err.Error())
         return err
     }
 

@@ -76,15 +76,25 @@ func (p *Producer) Start() error {
 
 // 连接conn and channel，根据bindingMode连接exchange and queue
 func (p *Producer) connect() (err error) {
+    // 建立连接
     p.logger.Println("[go-rabbitmq] attempt to connect rabbitmq.")
     if p.conn, err = amqp.Dial(p.addr); err != nil {
+        p.logger.Println("[go-rabbitmq] failed to connect to rabbitmq:", err.Error())
         return err
     }
+
+    // 创建一个Channel
     if p.channel, err = p.conn.Channel(); err != nil {
+        p.logger.Println("[go-rabbitmq] failed to open a channel:", err.Error())
         p.conn.Close()
         return err
     }
-    p.channel.Confirm(false)
+
+    err = p.channel.Confirm(false)
+    if err != nil {
+        p.logger.Println("[go-rabbitmq] failed to confirm a channel:", err.Error())
+        return err
+    }
 
     if p.bindingMode {
         if err = p.activeBinding(); err != nil {
@@ -109,6 +119,7 @@ func (p *Producer) connect() (err error) {
 
 // 自动创建(如果有则覆盖)exchange、queue，并绑定queue
 func (p *Producer) activeBinding() (err error) {
+    // 声明exchange
     if err = p.channel.ExchangeDeclare(
         p.exchange,
         p.exchangeType,
@@ -120,9 +131,11 @@ func (p *Producer) activeBinding() (err error) {
     ); err != nil {
         p.conn.Close()
         p.channel.Close()
+        p.logger.Println("[go-rabbitmq] failed to declare a exchange:", err.Error())
         return err
     }
 
+    // 声明一个queue
     if _, err = p.channel.QueueDeclare(
         p.queue,
         true,  // Durable
@@ -133,8 +146,11 @@ func (p *Producer) activeBinding() (err error) {
     ); err != nil {
         p.conn.Close()
         p.channel.Close()
+        p.logger.Println("[go-rabbitmq] failed to declare a queue:", err.Error())
         return err
     }
+
+    // exchange 绑定 queue
     if err = p.channel.QueueBind(
         p.queue,
         p.routerKey,
@@ -144,6 +160,7 @@ func (p *Producer) activeBinding() (err error) {
     ); err != nil {
         p.conn.Close()
         p.channel.Close()
+        p.logger.Println("[go-rabbitmq] failed to bind a queue:", err.Error())
         return err
     }
 
@@ -153,6 +170,7 @@ func (p *Producer) activeBinding() (err error) {
 // 检查exchange及queue是否存在，若不存在，則直接返回错误
 // 存在则绑定exchange及queue
 func (p *Producer) passiveBinding() (err error) {
+    // 声明exchange
     if err = p.channel.ExchangeDeclarePassive(
         p.exchange,
         p.exchangeType,
@@ -163,6 +181,7 @@ func (p *Producer) passiveBinding() (err error) {
         nil,
     ); err != nil {
         p.conn.Close()
+        p.logger.Println("[go-rabbitmq] failed to declare a exchange:", err.Error())
         return err
     }
 
@@ -175,6 +194,7 @@ func (p *Producer) passiveBinding() (err error) {
         nil,   // Arguments
     ); err != nil {
         p.conn.Close()
+        p.logger.Println("[go-rabbitmq] failed to declare a queue:", err.Error())
         return err
     }
     if err = p.channel.QueueBind(
@@ -186,6 +206,7 @@ func (p *Producer) passiveBinding() (err error) {
     ); err != nil {
         p.conn.Close()
         p.channel.Close()
+        p.logger.Println("[go-rabbitmq] failed to bind a queue:", err.Error())
         return err
     }
 
@@ -236,12 +257,13 @@ func (p *Producer) Push(data []byte) error {
                 Timestamp:       time.Now(),
             },
         ); err != nil {
-            p.logger.Println("[go-rabbitmq] push failed. retrying...")
+            p.logger.Printf("[go-rabbitmq] push failed [err=%s]. Retrying...", err.Error())
             currentTimes += 1
             if currentTimes < resendTimes {
                 time.Sleep(reconnectDelay)
                 continue
             } else {
+                p.logger.Println("[go-rabbitmq] push failed:", err.Error())
                 return err
             }
         }
