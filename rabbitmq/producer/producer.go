@@ -74,6 +74,11 @@ func (p *Producer) Start() error {
     return nil
 }
 
+// 判断连接是否断开
+func (p *Producer) IsClosed() bool {
+    return p.conn.IsClosed()
+}
+
 // 连接conn and channel，根据bindingMode连接exchange and queue
 func (p *Producer) connect() (err error) {
     // 建立连接

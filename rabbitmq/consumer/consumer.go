@@ -69,6 +69,11 @@ func (c *Consumer) Start() error {
     return nil
 }
 
+// 判断连接是否断开
+func (c *Consumer) IsClosed() bool {
+    return c.conn.IsClosed()
+}
+
 // 连接conn and channel，根据bindingMode连接exchange and queue
 func (c *Consumer) connect() (err error) {
     // 建立连接
