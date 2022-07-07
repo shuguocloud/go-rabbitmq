@@ -71,6 +71,7 @@ func (c *Consumer) Start() error {
 
 // 判断连接是否断开
 func (c *Consumer) IsClosed() bool {
+    c.logger.Println("[go-rabbitmq] rabbitmq has closed!")
     return c.conn.IsClosed()
 }
 

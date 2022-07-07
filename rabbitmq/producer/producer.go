@@ -26,9 +26,9 @@ var (
 type Producer struct {
     conn          *amqp.Connection
     channel       *amqp.Channel
-    notifyClose   chan *amqp.Error
-    notifyConfirm chan amqp.Confirmation
-    done          chan bool
+    notifyClose   chan *amqp.Error       // 如果异常关闭，会接受数据
+    notifyConfirm chan amqp.Confirmation // 消息发送成功确认，会接受到数据
+    done          chan bool              // 如果主动close，会接受数据
     isConnected   bool
 
     addr         string
@@ -76,6 +76,7 @@ func (p *Producer) Start() error {
 
 // 判断连接是否断开
 func (p *Producer) IsClosed() bool {
+    p.logger.Println("[go-rabbitmq] rabbitmq has closed!")
     return p.conn.IsClosed()
 }
 
@@ -226,6 +227,11 @@ func (p *Producer) reconnect() {
             return
         case <-p.notifyClose:
             p.logger.Println("[go-rabbitmq] rabbitmq notify close!")
+            if p.isConnected {
+                p.conn.Close()
+                p.channel.Close()
+                p.isConnected = false
+            }
         }
 
         p.isConnected = false
@@ -277,10 +283,14 @@ func (p *Producer) Push(data []byte) error {
         select {
         case confirm := <-p.notifyConfirm:
             if confirm.Ack {
-                p.logger.Println("[go-rabbitmq] push confirmed!")
+                p.logger.Println("[go-rabbitmq] push confirmed delivery with delivery tag: %d", confirm.DeliveryTag)
                 return nil
+            } else {
+                p.logger.Println("[go-rabbitmq] push nacked delivery of delivery tag: %d", confirm.DeliveryTag)
+                p.Close()
             }
         case <-ticker.C:
+            p.logger.Println("[go-rabbitmq] push timeout!")
         }
         p.logger.Println("[go-rabbitmq] push didn't confirm. retrying...")
     }
