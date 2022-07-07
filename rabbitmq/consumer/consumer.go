@@ -125,8 +125,8 @@ func (c *Consumer) activeBinding() (err error) {
         false,
         nil,
     ); err != nil {
-        c.conn.Close()
         c.channel.Close()
+        c.conn.Close()
         c.logger.Println("[go-rabbitmq] failed to declare a exchange:", err.Error())
         return err
     }
@@ -140,8 +140,8 @@ func (c *Consumer) activeBinding() (err error) {
         false, // No-wait
         nil,   // Arguments
     ); err != nil {
-        c.conn.Close()
         c.channel.Close()
+        c.conn.Close()
         c.logger.Println("[go-rabbitmq] failed to declare a queue:", err.Error())
         return err
     }
@@ -154,8 +154,8 @@ func (c *Consumer) activeBinding() (err error) {
         false,
         nil,
     ); err != nil {
-        c.conn.Close()
         c.channel.Close()
+        c.conn.Close()
         c.logger.Println("[go-rabbitmq] failed to bind a queue:", err.Error())
         return err
     }
@@ -200,8 +200,8 @@ func (c *Consumer) passiveBinding() (err error) {
         false,
         nil,
     ); err != nil {
-        c.conn.Close()
         c.channel.Close()
+        c.conn.Close()
         c.logger.Println("[go-rabbitmq] failed to bind a queue:", err.Error())
         return err
     }
@@ -218,6 +218,24 @@ func (c *Consumer) reconnect() {
             return
         case <-c.notifyClose:
             c.logger.Println("[go-rabbitmq] rabbitmq notify close!")
+        }
+
+        if !c.conn.IsClosed() {
+            // IMPORTANT: 必须清空 Notify，否则死连接不会释放
+            for err := range c.notifyClose {
+                println(err)
+            }
+
+            // 关闭 SubMsg common delivery
+            if err := c.channel.Cancel(c.consumerTag, true); err != nil {
+                c.logger.Println("[go-rabbitmq] rabbitmq consumer - channel cancel failed: ", err.Error())
+            }
+            if err := c.channel.Close(); err != nil {
+                c.logger.Println("[go-rabbitmq] rabbitmq consumer - channel close failed: ", err.Error())
+            }
+            if err := c.conn.Close(); err != nil {
+                c.logger.Println("[go-rabbitmq] rabbitmq consumer - connection close failed: ", err.Error())
+            }
         }
 
         c.isConnected = false
@@ -256,8 +274,8 @@ func (c *Consumer) Consume() (err error) {
         false,
         nil,
     ); err != nil {
-        c.conn.Close()
         c.channel.Close()
+        c.conn.Close()
         c.logger.Println("[go-rabbitmq] consume failed:", err.Error())
         return err
     }

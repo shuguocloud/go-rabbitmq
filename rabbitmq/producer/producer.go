@@ -139,8 +139,8 @@ func (p *Producer) activeBinding() (err error) {
         false,
         nil,
     ); err != nil {
-        p.conn.Close()
         p.channel.Close()
+        p.conn.Close()
         p.logger.Println("[go-rabbitmq] failed to declare a exchange:", err.Error())
         return err
     }
@@ -154,8 +154,8 @@ func (p *Producer) activeBinding() (err error) {
         false, // No-wait
         nil,   // Arguments
     ); err != nil {
-        p.conn.Close()
         p.channel.Close()
+        p.conn.Close()
         p.logger.Println("[go-rabbitmq] failed to declare a queue:", err.Error())
         return err
     }
@@ -168,8 +168,8 @@ func (p *Producer) activeBinding() (err error) {
         false,
         nil,
     ); err != nil {
-        p.conn.Close()
         p.channel.Close()
+        p.conn.Close()
         p.logger.Println("[go-rabbitmq] failed to bind a queue:", err.Error())
         return err
     }
@@ -214,8 +214,8 @@ func (p *Producer) passiveBinding() (err error) {
         false,
         nil,
     ); err != nil {
-        p.conn.Close()
         p.channel.Close()
+        p.conn.Close()
         p.logger.Println("[go-rabbitmq] failed to bind a queue:", err.Error())
         return err
     }
@@ -231,11 +231,16 @@ func (p *Producer) reconnect() {
             return
         case <-p.notifyClose:
             p.logger.Println("[go-rabbitmq] rabbitmq notify close!")
-            if p.isConnected {
-                p.conn.Close()
-                p.channel.Close()
-                p.isConnected = false
+        }
+
+        if p.conn != nil && !p.conn.IsClosed() {
+            // IMPORTANT: 必须清空 Notify，否则死连接不会释放
+            for err := range p.notifyClose {
+                println(err)
             }
+
+            p.channel.Close()
+            p.conn.Close()
         }
 
         p.isConnected = false
@@ -255,6 +260,7 @@ func (p *Producer) Push(data []byte) error {
     if !p.isConnected {
         p.logger.Println(errNotConnected.Error())
     }
+
     var currentTimes int
     for {
         if err := p.channel.Publish(
@@ -289,14 +295,20 @@ func (p *Producer) Push(data []byte) error {
             if confirm.Ack {
                 p.logger.Println("[go-rabbitmq] push confirmed delivery with delivery tag: %d", confirm.DeliveryTag)
                 return nil
-            } else {
-                p.logger.Println("[go-rabbitmq] push nacked delivery of delivery tag: %d", confirm.DeliveryTag)
-                p.Close()
             }
         case <-ticker.C:
             p.logger.Println("[go-rabbitmq] push timeout!")
         }
+
         p.logger.Println("[go-rabbitmq] push didn't confirm. retrying...")
+
+        // push消息异常处理
+        if p.conn != nil && !p.conn.IsClosed() {
+            p.channel.Close()
+            p.conn.Close()
+            p.isConnected = false
+            return errAlreadyClosed
+        }
     }
 }
 
