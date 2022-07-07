@@ -71,8 +71,12 @@ func (c *Consumer) Start() error {
 
 // 判断连接是否断开
 func (c *Consumer) IsClosed() bool {
-    c.logger.Println("[go-rabbitmq] rabbitmq has closed!")
-    return c.conn.IsClosed()
+    var isClosed bool
+    if c.conn.IsClosed() {
+        isClosed = true
+        c.logger.Println("[go-rabbitmq] rabbitmq has closed!")
+    }
+    return isClosed
 }
 
 // 连接conn and channel，根据bindingMode连接exchange and queue
