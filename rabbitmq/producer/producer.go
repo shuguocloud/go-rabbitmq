@@ -307,6 +307,7 @@ func (p *Producer) Push(data []byte) error {
             p.channel.Close()
             p.conn.Close()
             p.isConnected = false
+            p.logger.Println("[go-rabbitmq] push exceptionally!")
             return errAlreadyClosed
         }
     }
