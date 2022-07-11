@@ -264,6 +264,7 @@ func (p *Producer) reconnect() {
 func (p *Producer) Push(data []byte) error {
     if !p.isConnected {
         p.logger.Println(errNotConnected.Error())
+        return errNotConnected
     }
 
     var currentTimes int
