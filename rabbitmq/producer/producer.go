@@ -77,7 +77,12 @@ func (p *Producer) Start() error {
 // 判断连接是否断开
 func (p *Producer) IsClosed() bool {
     var isClosed bool
-    if p.conn.IsClosed() {
+    if p.conn == nil {
+        isClosed = true
+        p.logger.Println("[go-rabbitmq] rabbitmq has closed!")
+    }
+
+    if p.conn != nil && p.conn.IsClosed() {
         isClosed = true
         p.logger.Println("[go-rabbitmq] rabbitmq has closed!")
     }
