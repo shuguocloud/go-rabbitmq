@@ -21,6 +21,7 @@ const (
 var (
     errNotConnected  = errors.New("not connected to the producer")
     errAlreadyClosed = errors.New("already closed: not connected to the producer")
+    errShutdown      = errors.New("session is shutting down")
 )
 
 type Producer struct {
@@ -107,6 +108,7 @@ func (p *Producer) connect() (err error) {
 
     err = p.channel.Confirm(false)
     if err != nil {
+        close(p.notifyConfirm)
         p.logger.Println("[go-rabbitmq] failed to confirm a channel:", err.Error())
         return err
     }
@@ -301,6 +303,12 @@ func (p *Producer) Push(data []byte) error {
             if confirm.Ack {
                 p.logger.Println("[go-rabbitmq] push confirmed delivery with delivery tag: %d", confirm.DeliveryTag)
                 return nil
+            } else {
+                p.channel.Close()
+                p.conn.Close()
+                p.isConnected = false
+                p.logger.Println("[go-rabbitmq] push confirmed nack delivery of delivery tag: %d", confirm.DeliveryTag)
+                return errShutdown
             }
         case <-ticker.C:
             p.logger.Println("[go-rabbitmq] push timeout!")
