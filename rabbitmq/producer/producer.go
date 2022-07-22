@@ -10,6 +10,8 @@ import (
 )
 
 const (
+    // client default heartbeat
+    defaultHeartbeat = 10 * time.Second
     // every reconnect second when fail
     reconnectDelay = 5 * time.Second
     // every push message second when fail
@@ -27,36 +29,43 @@ var (
 type Producer struct {
     conn          *amqp.Connection
     channel       *amqp.Channel
-    notifyClose   chan *amqp.Error       // 如果异常关闭，会接受数据
+    connNotify    chan *amqp.Error       // 如果连接异常关闭，会接受数据
+    channelNotify chan *amqp.Error       // 如果管道异常关闭，会接受数据
     notifyConfirm chan amqp.Confirmation // 消息发送成功确认，会接受到数据
     done          chan bool              // 如果主动close，会接受数据
     isConnected   bool
 
+    // product dial config
     addr         string
     exchange     string
     exchangeType string
     queue        string
     routerKey    string
     contentType  string
+
     // true means auto create exchange and queue
     // false means passive create exchange and queue
     bindingMode bool
 
     headers amqp.Table
 
+    // producer heartbeat
+    heartbeat int64
+
     logger *log.Logger
 }
 
-func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool, headers amqp.Table, contentType string) *Producer {
+func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool, headers amqp.Table, contentType string, heartbeat int64) *Producer {
     producer := Producer{
         addr:         addr,
         exchange:     exchange,
         exchangeType: exchangeType,
         queue:        queue,
         routerKey:    routerKey,
+        contentType:  contentType,
         bindingMode:  bindingMode,
         headers:      headers,
-        contentType:  contentType,
+        heartbeat:    heartbeat,
         logger:       log.New(os.Stdout, "", log.LstdFlags),
         done:         make(chan bool),
     }
@@ -90,11 +99,21 @@ func (p *Producer) IsClosed() bool {
     return isClosed
 }
 
+func (p *Producer) setHeartBeat(heartbeat int64) time.Duration {
+    if heartbeat == 0 {
+        return defaultHeartbeat
+    } else {
+        return time.Duration(heartbeat) * time.Second
+    }
+}
+
 // 连接conn and channel，根据bindingMode连接exchange and queue
 func (p *Producer) connect() (err error) {
     // 建立连接
     p.logger.Println("[go-rabbitmq] attempt to connect rabbitmq.")
-    if p.conn, err = amqp.Dial(p.addr); err != nil {
+    if p.conn, err = amqp.DialConfig(p.addr, amqp.Config{
+        Heartbeat: p.setHeartBeat(p.heartbeat),
+    }); err != nil {
         p.logger.Println("[go-rabbitmq] failed to connect to rabbitmq:", err.Error())
         return err
     }
@@ -124,9 +143,9 @@ func (p *Producer) connect() (err error) {
     }
 
     p.isConnected = true
-    p.notifyClose = make(chan *amqp.Error)
+    p.connNotify = p.conn.NotifyClose(make(chan *amqp.Error))
+    p.channelNotify = p.channel.NotifyClose(make(chan *amqp.Error))
     p.notifyConfirm = make(chan amqp.Confirmation)
-    p.channel.NotifyClose(p.notifyClose)
     p.channel.NotifyPublish(p.notifyConfirm)
 
     p.logger.Println("[go-rabbitmq] rabbitmq is connected.")
@@ -236,18 +255,32 @@ func (p *Producer) reconnect() {
         select {
         case <-p.done:
             return
-        case <-p.notifyClose:
-            p.logger.Println("[go-rabbitmq] rabbitmq notify close!")
+        case err := <-p.connNotify:
+            if err != nil {
+                p.logger.Printf("[go-rabbitmq] rabbitmq producter - connect notify close err=[%s]!", err.Error())
+            }
+        case err := <-p.channelNotify:
+            if err != nil {
+                p.logger.Printf("[go-rabbitmq] rabbitmq producter - channel notify close err=[%s]!", err.Error())
+            }
         }
 
         if p.conn != nil && !p.conn.IsClosed() {
-            // IMPORTANT: 必须清空 Notify，否则死连接不会释放
-            for err := range p.notifyClose {
-                println(err)
+            if err := p.channel.Close(); err != nil {
+                p.logger.Println("[go-rabbitmq] rabbitmq producter - channel close failed: ", err.Error())
             }
+            if err := p.conn.Close(); err != nil {
+                p.logger.Println("[go-rabbitmq] rabbitmq producter - connection close failed: ", err.Error())
+            }
+        }
 
-            p.channel.Close()
-            p.conn.Close()
+        // IMPORTANT: 必须清空 Notify，否则死连接不会释放
+        for err := range p.channelNotify {
+            println(err)
+        }
+
+        for err := range p.connNotify {
+            println(err)
         }
 
         p.isConnected = false

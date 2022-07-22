@@ -25,6 +25,7 @@ func main() {
             false,
             headers,
             "application/json",
+            60,
         )
         if err := p.Start(); err != nil {
             log.Panic(err)
@@ -54,6 +55,7 @@ func main() {
             "test.platform.amq",
             handler,
             false,
+            60,
         )
         if err := c.Start(); err != nil {
             log.Panic(err)
