@@ -85,12 +85,12 @@ func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool
 func (p *Producer) handleReconnect(addr string) {
     for {
         p.isReady = false
-        log.Println("Attempting to connect")
+        p.logger.Println("[go-rabbitmq] Attempt to connect.")
 
         conn, err := p.connect(addr)
 
         if err != nil {
-            log.Println("Failed to connect. Retrying...")
+            p.logger.Println("[go-rabbitmq] Failed to connect. Retrying..")
 
             select {
             case <-p.done:
@@ -116,13 +116,12 @@ func (p *Producer) setHeartBeat(heartbeat int64) time.Duration {
 
 // connect will create a new AMQP connection
 func (p *Producer) connect(addr string) (*amqp.Connection, error) {
-    p.logger.Println("[go-rabbitmq] attempt to connect rabbitmq.")
     conn, err := amqp.DialConfig(addr, amqp.Config{
         Heartbeat: p.setHeartBeat(p.heartbeat),
     })
 
     if err != nil {
-        p.logger.Println("[go-rabbitmq] failed to connect to rabbitmq:", err.Error())
+        p.logger.Println("[go-rabbitmq] Failed to connect:", err.Error())
         return nil, err
     }
 
@@ -139,7 +138,7 @@ func (p *Producer) handleReInit(conn *amqp.Connection) bool {
 
         err := p.init(conn)
         if err != nil {
-            p.logger.Println("Failed to initialize channel. Retrying...")
+            p.logger.Println("[go-rabbitmq] Failed to initialize channel. Retrying...")
 
             select {
             case <-p.done:
@@ -165,13 +164,13 @@ func (p *Producer) handleReInit(conn *amqp.Connection) bool {
 func (p *Producer) init(conn *amqp.Connection) error {
     ch, err := conn.Channel()
     if err != nil {
-        p.logger.Println("[go-rabbitmq] failed to open a channel:", err.Error())
+        p.logger.Println("[go-rabbitmq] Failed to open a channel:", err.Error())
         return err
     }
 
     err = ch.Confirm(false)
     if err != nil {
-        p.logger.Println("[go-rabbitmq] failed to confirm a channel:", err.Error())
+        p.logger.Println("[go-rabbitmq] Failed to confirm a channel:", err.Error())
         return err
     }
 
@@ -185,7 +184,7 @@ func (p *Producer) init(conn *amqp.Connection) error {
         nil,
     )
     if err != nil {
-        p.logger.Println("[go-rabbitmq] failed to declare a exchange:", err.Error())
+        p.logger.Println("[go-rabbitmq] Failed to declare a exchange:", err.Error())
         return err
     }
 
@@ -198,7 +197,7 @@ func (p *Producer) init(conn *amqp.Connection) error {
         nil,   // Arguments
     )
     if err != nil {
-        p.logger.Println("[go-rabbitmq] failed to declare a queue:", err.Error())
+        p.logger.Println("[go-rabbitmq] Failed to declare a queue:", err.Error())
         return err
     }
 
@@ -210,7 +209,7 @@ func (p *Producer) init(conn *amqp.Connection) error {
         nil,
     )
     if err != nil {
-        p.logger.Println("[go-rabbitmq] failed to bind a queue:", err.Error())
+        p.logger.Println("[go-rabbitmq] Failed to bind a queue:", err.Error())
         return err
     }
 
