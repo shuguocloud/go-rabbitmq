@@ -9,31 +9,14 @@ import (
     "github.com/streadway/amqp"
 )
 
-const (
-    // client default heartbeat
-    defaultHeartbeat = 10 * time.Second
-    // every reconnect second when fail
-    reconnectDelay = 5 * time.Second
-    // every push message second when fail
-    resendDelay = 5 * time.Second
-    // push times when fail
-    resendTimes = 3
-)
-
-var (
-    errNotConnected  = errors.New("not connected to the producer")
-    errAlreadyClosed = errors.New("already closed: not connected to the producer")
-    errShutdown      = errors.New("session is shutting down")
-)
-
 type Producer struct {
-    conn          *amqp.Connection
-    channel       *amqp.Channel
-    connNotify    chan *amqp.Error       // 如果连接异常关闭，会接受数据
-    channelNotify chan *amqp.Error       // 如果管道异常关闭，会接受数据
-    notifyConfirm chan amqp.Confirmation // 消息发送成功确认，会接受到数据
-    done          chan bool              // 如果主动close，会接受数据
-    isConnected   bool
+    connection      *amqp.Connection
+    channel         *amqp.Channel
+    notifyConnClose chan *amqp.Error       // 如果连接异常关闭，会接受数据
+    notifyChanClose chan *amqp.Error       // 如果管道异常关闭，会接受数据
+    notifyConfirm   chan amqp.Confirmation // 消息发送成功确认，会接受到数据
+    done            chan bool              // 如果主动close，会接受数据
+    isReady         bool
 
     // product dial config
     addr         string
@@ -55,8 +38,30 @@ type Producer struct {
     logger *log.Logger
 }
 
+const (
+    // client default heartbeat
+    defaultHeartbeat = 10 * time.Second
+
+    // When reconnecting to the server after connection failure
+    reconnectDelay = 5 * time.Second
+
+    // When setting up the channel after a channel exception
+    reInitDelay = 2 * time.Second
+
+    // When resending messages the server didn't confirm
+    resendDelay = 5 * time.Second
+)
+
+var (
+    errNotConnected  = errors.New("not connected to a server")
+    errAlreadyClosed = errors.New("already closed: not connected to the server")
+    errShutdown      = errors.New("session is shutting down")
+)
+
+// New creates a new consumer state instance, and automatically
+// attempts to connect to the server.
 func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool, headers amqp.Table, contentType string, heartbeat int64) *Producer {
-    producer := Producer{
+    p := Producer{
         addr:         addr,
         exchange:     exchange,
         exchangeType: exchangeType,
@@ -70,33 +75,35 @@ func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool
         done:         make(chan bool),
     }
 
-    return &producer
+    go p.handleReconnect(addr)
+
+    return &p
 }
 
-// 首次连接rabbitmq，有错即返回
-// 沒有遇错，则开启goroutine循环检查是否断线
-func (p *Producer) Start() error {
-    if err := p.connect(); err != nil {
-        return err
-    }
+// handleReconnect will wait for a connection error on
+// notifyConnClose, and then continuously attempt to reconnect.
+func (p *Producer) handleReconnect(addr string) {
+    for {
+        p.isReady = false
+        log.Println("Attempting to connect")
 
-    go p.reconnect()
-    return nil
-}
+        conn, err := p.connect(addr)
 
-// 判断连接是否断开
-func (p *Producer) IsClosed() bool {
-    var isClosed bool
-    if p.conn == nil {
-        isClosed = true
-        p.logger.Println("[go-rabbitmq] rabbitmq has closed!")
-    }
+        if err != nil {
+            log.Println("Failed to connect. Retrying...")
 
-    if p.conn != nil && p.conn.IsClosed() {
-        isClosed = true
-        p.logger.Println("[go-rabbitmq] rabbitmq has closed!")
+            select {
+            case <-p.done:
+                return
+            case <-time.After(reconnectDelay):
+            }
+            continue
+        }
+
+        if done := p.handleReInit(conn); done {
+            break
+        }
     }
-    return isClosed
 }
 
 func (p *Producer) setHeartBeat(heartbeat int64) time.Duration {
@@ -107,273 +114,202 @@ func (p *Producer) setHeartBeat(heartbeat int64) time.Duration {
     }
 }
 
-// 连接conn and channel，根据bindingMode连接exchange and queue
-func (p *Producer) connect() (err error) {
-    // 建立连接
+// connect will create a new AMQP connection
+func (p *Producer) connect(addr string) (*amqp.Connection, error) {
     p.logger.Println("[go-rabbitmq] attempt to connect rabbitmq.")
-    if p.conn, err = amqp.DialConfig(p.addr, amqp.Config{
+    conn, err := amqp.DialConfig(addr, amqp.Config{
         Heartbeat: p.setHeartBeat(p.heartbeat),
-    }); err != nil {
-        p.logger.Println("[go-rabbitmq] failed to connect to rabbitmq:", err.Error())
-        return err
-    }
+    })
 
-    // 创建一个Channel
-    if p.channel, err = p.conn.Channel(); err != nil {
-        p.logger.Println("[go-rabbitmq] failed to open a channel:", err.Error())
-        p.conn.Close()
-        return err
-    }
-
-    err = p.channel.Confirm(false)
     if err != nil {
-        close(p.notifyConfirm)
+        p.logger.Println("[go-rabbitmq] failed to connect to rabbitmq:", err.Error())
+        return nil, err
+    }
+
+    p.changeConnection(conn)
+    log.Println("[go-rabbitmq] Connected!")
+    return conn, nil
+}
+
+// handleReconnect will wait for a channel error
+// and then continuously attempt to re-initialize both channels
+func (p *Producer) handleReInit(conn *amqp.Connection) bool {
+    for {
+        p.isReady = false
+
+        err := p.init(conn)
+        if err != nil {
+            log.Println("Failed to initialize channel. Retrying...")
+
+            select {
+            case <-p.done:
+                return true
+            case <-time.After(reInitDelay):
+            }
+            continue
+        }
+
+        select {
+        case <-p.done:
+            return true
+        case <-p.notifyConnClose:
+            log.Println("[go-rabbitmq] Connection closed. Reconnecting...")
+            return false
+        case <-p.notifyChanClose:
+            log.Println("[go-rabbitmq] Channel closed. Re-running init...")
+        }
+    }
+}
+
+// init will initialize channel & declare queue
+func (p *Producer) init(conn *amqp.Connection) error {
+    ch, err := conn.Channel()
+    if err != nil {
+        p.logger.Println("[go-rabbitmq] failed to open a channel:", err.Error())
+        return err
+    }
+
+    err = ch.Confirm(false)
+    if err != nil {
         p.logger.Println("[go-rabbitmq] failed to confirm a channel:", err.Error())
         return err
     }
 
-    if p.bindingMode {
-        if err = p.activeBinding(); err != nil {
-            return err
-        }
-    } else {
-        if err = p.passiveBinding(); err != nil {
-            return err
-        }
+    err = ch.ExchangeDeclare(
+        p.exchange,
+        p.exchangeType,
+        true,
+        false,
+        false,
+        false,
+        nil,
+    )
+    if err != nil {
+        p.logger.Println("[go-rabbitmq] failed to declare a exchange:", err.Error())
+        return err
     }
 
-    p.isConnected = true
-    p.connNotify = p.conn.NotifyClose(make(chan *amqp.Error))
-    p.channelNotify = p.channel.NotifyClose(make(chan *amqp.Error))
-    p.notifyConfirm = make(chan amqp.Confirmation)
+    _, err = ch.QueueDeclare(
+        p.queue,
+        true,  // Durable
+        false, // Delete when unused
+        false, // Exclusive
+        false, // No-wait
+        nil,   // Arguments
+    )
+    if err != nil {
+        p.logger.Println("[go-rabbitmq] failed to declare a queue:", err.Error())
+        return err
+    }
+
+    err = ch.QueueBind(
+        p.queue,
+        p.routerKey,
+        p.exchange,
+        false,
+        nil,
+    )
+    if err != nil {
+        p.logger.Println("[go-rabbitmq] failed to bind a queue:", err.Error())
+        return err
+    }
+
+    p.changeChannel(ch)
+    p.isReady = true
+    log.Println("[go-rabbitmq] Setup!")
+
+    return nil
+}
+
+// changeConnection takes a new connection to the queue,
+// and updates the close listener to reflect this.
+func (p *Producer) changeConnection(connection *amqp.Connection) {
+    p.connection = connection
+    p.notifyConnClose = make(chan *amqp.Error)
+    p.connection.NotifyClose(p.notifyConnClose)
+}
+
+// changeChannel takes a new channel to the queue,
+// and updates the channel listeners to reflect this.
+func (p *Producer) changeChannel(channel *amqp.Channel) {
+    p.channel = channel
+    p.notifyChanClose = make(chan *amqp.Error)
+    p.notifyConfirm = make(chan amqp.Confirmation, 1)
+    p.channel.NotifyClose(p.notifyChanClose)
     p.channel.NotifyPublish(p.notifyConfirm)
-
-    p.logger.Println("[go-rabbitmq] rabbitmq is connected.")
-
-    return nil
 }
 
-// 自动创建(如果有则覆盖)exchange、queue，并绑定queue
-func (p *Producer) activeBinding() (err error) {
-    // 声明exchange
-    if err = p.channel.ExchangeDeclare(
-        p.exchange,
-        p.exchangeType,
-        true,
-        false,
-        false,
-        false,
-        nil,
-    ); err != nil {
-        p.channel.Close()
-        p.conn.Close()
-        p.logger.Println("[go-rabbitmq] failed to declare a exchange:", err.Error())
-        return err
-    }
-
-    // 声明一个queue
-    if _, err = p.channel.QueueDeclare(
-        p.queue,
-        true,  // Durable
-        false, // Delete when unused
-        false, // Exclusive
-        false, // No-wait
-        nil,   // Arguments
-    ); err != nil {
-        p.channel.Close()
-        p.conn.Close()
-        p.logger.Println("[go-rabbitmq] failed to declare a queue:", err.Error())
-        return err
-    }
-
-    // exchange 绑定 queue
-    if err = p.channel.QueueBind(
-        p.queue,
-        p.routerKey,
-        p.exchange,
-        false,
-        nil,
-    ); err != nil {
-        p.channel.Close()
-        p.conn.Close()
-        p.logger.Println("[go-rabbitmq] failed to bind a queue:", err.Error())
-        return err
-    }
-
-    return nil
-}
-
-// 检查exchange及queue是否存在，若不存在，則直接返回错误
-// 存在则绑定exchange及queue
-func (p *Producer) passiveBinding() (err error) {
-    // 声明exchange
-    if err = p.channel.ExchangeDeclarePassive(
-        p.exchange,
-        p.exchangeType,
-        true,
-        false,
-        false,
-        false,
-        nil,
-    ); err != nil {
-        p.conn.Close()
-        p.logger.Println("[go-rabbitmq] failed to declare a exchange:", err.Error())
-        return err
-    }
-
-    if _, err = p.channel.QueueDeclarePassive(
-        p.queue,
-        true,  // Durable
-        false, // Delete when unused
-        false, // Exclusive
-        false, // No-wait
-        nil,   // Arguments
-    ); err != nil {
-        p.conn.Close()
-        p.logger.Println("[go-rabbitmq] failed to declare a queue:", err.Error())
-        return err
-    }
-    if err = p.channel.QueueBind(
-        p.queue,
-        p.routerKey,
-        p.exchange,
-        false,
-        nil,
-    ); err != nil {
-        p.channel.Close()
-        p.conn.Close()
-        p.logger.Println("[go-rabbitmq] failed to bind a queue:", err.Error())
-        return err
-    }
-
-    return nil
-}
-
-// 重新连接rabbitmq
-func (p *Producer) reconnect() {
-    for {
-        select {
-        case <-p.done:
-            return
-        case err := <-p.connNotify:
-            if err != nil {
-                p.logger.Printf("[go-rabbitmq] rabbitmq producter - connect notify close err=[%s]!", err.Error())
-            }
-        case err := <-p.channelNotify:
-            if err != nil {
-                p.logger.Printf("[go-rabbitmq] rabbitmq producter - channel notify close err=[%s]!", err.Error())
-            }
-        }
-
-        if p.conn != nil && !p.conn.IsClosed() {
-            if err := p.channel.Close(); err != nil {
-                p.logger.Println("[go-rabbitmq] rabbitmq producter - channel close failed: ", err.Error())
-            }
-            if err := p.conn.Close(); err != nil {
-                p.logger.Println("[go-rabbitmq] rabbitmq producter - connection close failed: ", err.Error())
-            }
-        }
-
-        // IMPORTANT: 必须清空 Notify，否则死连接不会释放
-        for err := range p.channelNotify {
-            println(err)
-        }
-
-        for err := range p.connNotify {
-            println(err)
-        }
-
-        p.isConnected = false
-        for !p.isConnected {
-            if err := p.connect(); err != nil {
-                p.logger.Printf("[go-rabbitmq] failed to connect rabbitmq [err=%s]. Retrying...", err.Error())
-                time.Sleep(reconnectDelay)
-            }
-        }
-    }
-}
-
-// 当push失败，则wait resend time，在重新push
-// 累积resendTimes则返回error
-// push成功，检查有无回传confirm，沒有也代表push失败，并wait resend time，在重新push
+// Push will push data onto the queue, and wait for a confirm.
+// If no confirms are received until within the resendTimeout,
+// it continuously re-sends messages until a confirm is received.
+// This will block until the server sends a confirm. Errors are
+// only returned if the push action itself fails, see UnsafePush.
 func (p *Producer) Push(data []byte) error {
-    if !p.isConnected {
-        p.logger.Println(errNotConnected.Error())
-        return errNotConnected
+    if !p.isReady {
+        return errors.New("failed to push: not connected")
     }
-
-    var currentTimes int
     for {
-        if err := p.channel.Publish(
-            p.exchange,  // Exchange
-            p.routerKey, // Routing key
-            false,       // Mandatory
-            false,       // Immediate
-            amqp.Publishing{
-                Headers:         p.headers,
-                ContentType:     p.contentType,
-                ContentEncoding: "",
-                Body:            data,
-                DeliveryMode:    amqp.Persistent, // 1=non-persistent, 2=persistent
-                Priority:        0,               // 0-9
-                Timestamp:       time.Now(),
-            },
-        ); err != nil {
-            p.logger.Printf("[go-rabbitmq] push failed [err=%s]. Retrying...", err.Error())
-            currentTimes += 1
-            if currentTimes < resendTimes {
-                time.Sleep(reconnectDelay)
-                continue
-            } else {
-                p.logger.Println("[go-rabbitmq] push failed:", err.Error())
-                return err
+        err := p.UnsafePush(data)
+        if err != nil {
+            p.logger.Println("Push failed. Retrying...")
+            select {
+            case <-p.done:
+                return errShutdown
+            case <-time.After(resendDelay):
             }
+            continue
         }
-
-        ticker := time.NewTicker(resendDelay)
         select {
         case confirm := <-p.notifyConfirm:
             if confirm.Ack {
                 p.logger.Println("[go-rabbitmq] push confirmed delivery with delivery tag: %d", confirm.DeliveryTag)
                 return nil
-            } else {
-                p.channel.Close()
-                p.conn.Close()
-                p.isConnected = false
-                p.logger.Println("[go-rabbitmq] push confirmed nack delivery of delivery tag: %d", confirm.DeliveryTag)
-                return errShutdown
             }
-        case <-ticker.C:
-            p.logger.Println("[go-rabbitmq] push timeout!")
+        case <-time.After(resendDelay):
         }
-
         p.logger.Println("[go-rabbitmq] push didn't confirm. retrying...")
-
-        // push消息异常处理
-        if p.conn != nil && !p.conn.IsClosed() {
-            p.channel.Close()
-            p.conn.Close()
-            p.isConnected = false
-            p.logger.Println("[go-rabbitmq] push exceptionally!")
-            return errAlreadyClosed
-        }
     }
 }
 
-// 关闭rabbitmq conn and channel
+// UnsafePush will push to the queue without checking for
+// confirmation. It returns an error if it fails to connect.
+// No guarantees are provided for whether the server will
+// recieve the message.
+func (p *Producer) UnsafePush(data []byte) error {
+    if !p.isReady {
+        return errNotConnected
+    }
+    return p.channel.Publish(
+        p.exchange,  // Exchange
+        p.routerKey, // Routing key
+        false,       // Mandatory
+        false,       // Immediate
+        amqp.Publishing{
+            Headers:         p.headers,
+            ContentType:     p.contentType,
+            ContentEncoding: "",
+            Body:            data,
+            DeliveryMode:    amqp.Persistent, // 1=non-persistent, 2=persistent
+            Priority:        0,               // 0-9
+            Timestamp:       time.Now(),
+        },
+    )
+}
+
+// Close will cleanly shutdown the channel and connection.
 func (p *Producer) Close() error {
-    if !p.isConnected {
+    if !p.isReady {
         return errAlreadyClosed
     }
     err := p.channel.Close()
     if err != nil {
         return err
     }
-    err = p.conn.Close()
+    err = p.connection.Close()
     if err != nil {
         return err
     }
     close(p.done)
-    p.isConnected = false
+    p.isReady = false
     return nil
 }
