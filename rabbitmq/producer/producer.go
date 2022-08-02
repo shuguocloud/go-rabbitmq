@@ -127,7 +127,7 @@ func (p *Producer) connect(addr string) (*amqp.Connection, error) {
     }
 
     p.changeConnection(conn)
-    log.Println("[go-rabbitmq] Connected!")
+    p.logger.Println("[go-rabbitmq] Connected!")
     return conn, nil
 }
 
@@ -139,7 +139,7 @@ func (p *Producer) handleReInit(conn *amqp.Connection) bool {
 
         err := p.init(conn)
         if err != nil {
-            log.Println("Failed to initialize channel. Retrying...")
+            p.logger.Println("Failed to initialize channel. Retrying...")
 
             select {
             case <-p.done:
@@ -153,10 +153,10 @@ func (p *Producer) handleReInit(conn *amqp.Connection) bool {
         case <-p.done:
             return true
         case <-p.notifyConnClose:
-            log.Println("[go-rabbitmq] Connection closed. Reconnecting...")
+            p.logger.Println("[go-rabbitmq] Connection closed. Reconnecting...")
             return false
         case <-p.notifyChanClose:
-            log.Println("[go-rabbitmq] Channel closed. Re-running init...")
+            p.logger.Println("[go-rabbitmq] Channel closed. Re-running init...")
         }
     }
 }
@@ -216,7 +216,7 @@ func (p *Producer) init(conn *amqp.Connection) error {
 
     p.changeChannel(ch)
     p.isReady = true
-    log.Println("[go-rabbitmq] Setup!")
+    p.logger.Println("[go-rabbitmq] Setup!")
 
     return nil
 }
