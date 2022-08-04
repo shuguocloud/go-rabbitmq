@@ -15,21 +15,22 @@ func main() {
     headers["test.topic"] = "platformData"
 
     go func() {
-
-        p := producer.New(
-            "amqp://guest:guest@localhost:5672/",
-            "amq.direct",
-            "direct",
-            "test.platform.mq",
-            "test.platform.amq",
-            false,
-            headers,
-            "application/json",
-            60,
-        )
-        if err := p.Start(); err != nil {
-            log.Panic(err)
+        var p *producer.Producer
+        if p == nil || p != nil && p.IsClosed() {
+            // 重新连接
+            p = producer.New(
+                "amqp://guest:guest@localhost:5672/",
+                "amq.direct",
+                "direct",
+                "test.platform.mq",
+                "test.platform.amq",
+                false,
+                headers,
+                "application/json",
+                60,
+            )
         }
+
         for {
             // msg := bytes.NewBufferString("hello")
             //msg := bytes.NewBuffer([]byte("hello"))
