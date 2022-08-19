@@ -56,6 +56,7 @@ var (
     errNotConnected  = errors.New("not connected to a server")
     errAlreadyClosed = errors.New("already closed: not connected to the server")
     errShutdown      = errors.New("session is shutting down")
+    errPushException = errors.New("already closed: push exceptionally")
 )
 
 // New creates a new consumer state instance, and automatically
@@ -186,7 +187,9 @@ func (p *Producer) init(conn *amqp.Connection) error {
     ch, err := conn.Channel()
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to open a channel.", err.Error())
-		p.connection.Close()
+        if p.connection != nil {
+            p.connection.Close()
+        }
         return err
     }
 
@@ -203,9 +206,13 @@ func (p *Producer) init(conn *amqp.Connection) error {
     )
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to declare a exchange.", err.Error())
-		p.channel.Close()
-		p.connection.Close()
-		return err
+        if p.channel != nil {
+            p.channel.Close()
+        }
+        if p.connection != nil {
+            p.connection.Close()
+        }
+        return err
     }
 
     _, err = ch.QueueDeclare(
@@ -218,8 +225,12 @@ func (p *Producer) init(conn *amqp.Connection) error {
     )
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to declare a queue.", err.Error())
-		p.channel.Close()
-		p.connection.Close()
+        if p.channel != nil {
+            p.channel.Close()
+        }
+        if p.connection != nil {
+            p.connection.Close()
+        }
         return err
     }
 
@@ -232,16 +243,24 @@ func (p *Producer) init(conn *amqp.Connection) error {
     )
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to bind a queue.", err.Error())
-		p.channel.Close()
-		p.connection.Close()
+        if p.channel != nil {
+            p.channel.Close()
+        }
+        if p.connection != nil {
+            p.connection.Close()
+        }
         return err
     }
 
     err = ch.Confirm(false)
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to confirm a channel.", err.Error())
-		p.channel.Close()
-		p.connection.Close()
+        if p.channel != nil {
+            p.channel.Close()
+        }
+        if p.connection != nil {
+            p.connection.Close()
+        }
         return err
     }
 
@@ -304,7 +323,11 @@ func (p *Producer) Push(data []byte) error {
         // push消息异常处理
         if p.connection != nil && !p.connection.IsClosed() {
             p.logger.Println("[go-rabbitmq] Push exceptionally!")
-            return p.Close()
+            if p.channel != nil {
+                p.channel.Close()
+            }
+            p.connection.Close()
+            return errPushException
         }
     }
 }
