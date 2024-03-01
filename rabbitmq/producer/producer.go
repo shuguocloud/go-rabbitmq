@@ -313,7 +313,7 @@ func (p *Producer) Push(data []byte) error {
         select {
         case confirm := <-p.notifyConfirm:
             if confirm.Ack {
-                p.logger.Println("[go-rabbitmq] Push confirmed delivery with delivery tag: %d", confirm.DeliveryTag)
+                // p.logger.Println("[go-rabbitmq] Push confirmed delivery with delivery tag: %d", confirm.DeliveryTag)
                 return nil
             }
         case <-time.After(resendDelay):
