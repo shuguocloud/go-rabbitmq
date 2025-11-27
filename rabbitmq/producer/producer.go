@@ -50,6 +50,9 @@ const (
 
     // When resending messages the server didn't confirm
     resendDelay = 5 * time.Second
+
+    // push times when fail
+    resendTimes = 3
 )
 
 var (
@@ -101,6 +104,7 @@ func (p *Producer) IsClosed() bool {
 func (p *Producer) handleReconnect(addr string) {
     for {
         p.isConnected = false
+
         p.logger.Println("[go-rabbitmq] Attempt to connect.")
 
         conn, err := p.connect(addr)
@@ -160,6 +164,9 @@ func (p *Producer) handleReInit(conn *amqp.Connection) bool {
             select {
             case <-p.done:
                 return true
+            case <-p.notifyConnClose:
+                p.logger.Printf("[go-rabbitmq] Connection closed [err=%s]. Reconnecting...", err.Error())
+                return false
             case <-time.After(reInitDelay):
             }
             continue
@@ -193,7 +200,17 @@ func (p *Producer) init(conn *amqp.Connection) error {
         return err
     }
 
-    //defer ch.Close()
+    err = ch.Confirm(false)
+    if err != nil {
+        p.logger.Printf("[go-rabbitmq] Failed [err=%s] to confirm a channel.", err.Error())
+        if p.channel != nil {
+            p.channel.Close()
+        }
+        if p.connection != nil {
+            p.connection.Close()
+        }
+        return err
+    }
 
     err = ch.ExchangeDeclare(
         p.exchange,
@@ -252,18 +269,6 @@ func (p *Producer) init(conn *amqp.Connection) error {
         return err
     }
 
-    err = ch.Confirm(false)
-    if err != nil {
-        p.logger.Printf("[go-rabbitmq] Failed [err=%s] to confirm a channel.", err.Error())
-        if p.channel != nil {
-            p.channel.Close()
-        }
-        if p.connection != nil {
-            p.connection.Close()
-        }
-        return err
-    }
-
     p.changeChannel(ch)
     p.isConnected = true
     p.logger.Println("[go-rabbitmq] Setup!")
@@ -296,39 +301,36 @@ func (p *Producer) changeChannel(channel *amqp.Channel) {
 // only returned if the push action itself fails, see UnsafePush.
 func (p *Producer) Push(data []byte) error {
     if !p.isConnected {
-        return errors.New("failed to push: not connected")
+        return errNotConnected
     }
+
+    var currentTimes int
     for {
         err := p.UnsafePush(data)
         if err != nil {
             p.logger.Printf("[go-rabbitmq] Push failed [err=%s]. Retrying...", err.Error())
 
-            select {
-            case <-p.done:
-                return errShutdown
-            case <-time.After(resendDelay):
+            currentTimes += 1
+            if currentTimes < resendTimes {
+                // time.Sleep(reconnectDelay)
+                continue
+            } else {
+                return err
             }
-            continue
         }
+
+        // Wait for confirmation
+        ticker := time.NewTicker(resendDelay)
         select {
         case confirm := <-p.notifyConfirm:
             if confirm.Ack {
                 // p.logger.Println("[go-rabbitmq] Push confirmed delivery with delivery tag: %d", confirm.DeliveryTag)
                 return nil
             }
-        case <-time.After(resendDelay):
+        case <-ticker.C:
         }
-        p.logger.Println("[go-rabbitmq] Push didn't confirm. Retrying...")
 
-        // push消息异常处理
-        if p.connection != nil && !p.connection.IsClosed() {
-            p.logger.Println("[go-rabbitmq] Push exceptionally!")
-            if p.channel != nil {
-                p.channel.Close()
-            }
-            p.connection.Close()
-            return errPushException
-        }
+        p.logger.Println("[go-rabbitmq] Push didn't confirm. Retrying...")
     }
 }
 
@@ -340,6 +342,7 @@ func (p *Producer) UnsafePush(data []byte) error {
     if !p.isConnected {
         return errNotConnected
     }
+
     return p.channel.Publish(
         p.exchange,  // Exchange
         p.routerKey, // Routing key
