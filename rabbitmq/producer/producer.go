@@ -312,7 +312,7 @@ func (p *Producer) Push(data []byte) error {
 
             currentTimes += 1
             if currentTimes < resendTimes {
-                // time.Sleep(reconnectDelay)
+                time.Sleep(reconnectDelay)
                 continue
             } else {
                 return err
