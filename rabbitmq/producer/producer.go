@@ -4,6 +4,7 @@ import (
     "errors"
     "log"
     "os"
+    "sync"
     "time"
 
     "github.com/streadway/amqp"
@@ -35,6 +36,11 @@ type Producer struct {
     // producer heartbeat
     heartbeat int64
 
+    // Audit 030：串行化"发布 + 等确认"，并按 DeliveryTag 精确匹配本次发布，
+    // 避免超时重发遗留的陈旧确认被误判为本次发送成功。
+    pushMu sync.Mutex
+    tagGen uint64 // 当前 channel 上已发布的消息序号（等价于 broker 侧 delivery tag）
+
     logger *log.Logger
 }
 
@@ -53,6 +59,10 @@ const (
 
     // push times when fail
     resendTimes = 3
+
+    // Audit 030：确认通道缓冲。streadway 的 confirms 在连接 reader goroutine 中
+    // 向 listener 同步投递，缓冲过小（原为 1）会阻塞整个连接的帧分发。
+    confirmBufferSize = 256
 )
 
 var (
@@ -287,63 +297,110 @@ func (p *Producer) changeConnection(connection *amqp.Connection) {
 // changeChannel takes a new channel to the queue,
 // and updates the channel listeners to reflect this.
 func (p *Producer) changeChannel(channel *amqp.Channel) {
+    p.pushMu.Lock()
+    p.tagGen = 0 // 新 channel 的 delivery tag 从 1 重新计数
     p.channel = channel
     p.notifyChanClose = make(chan *amqp.Error)
-    p.notifyConfirm = make(chan amqp.Confirmation, 1)
-    p.channel.NotifyClose(p.notifyChanClose)
-    p.channel.NotifyPublish(p.notifyConfirm)
+    p.notifyConfirm = make(chan amqp.Confirmation, confirmBufferSize)
+    notifyChanClose, notifyConfirm := p.notifyChanClose, p.notifyConfirm
+    p.pushMu.Unlock()
+
+    channel.NotifyClose(notifyChanClose)
+    channel.NotifyPublish(notifyConfirm)
 }
 
-// Push will push data onto the queue, and wait for a confirm.
-// If no confirms are received until within the resendTimeout,
-// it continuously re-sends messages until a confirm is received.
-// This will block until the server sends a confirm. Errors are
-// only returned if the push action itself fails, see UnsafePush.
+// Push will push data onto the queue, and wait for confirm.
+// 若超时未确认则重发，最多 resendTimes 次；仅当收到与本次发布 DeliveryTag
+// 匹配的 Ack 才视为成功，避免陈旧确认导致的"假成功丢消息"。
 func (p *Producer) Push(data []byte) error {
     if !p.isConnected {
         return errNotConnected
     }
 
-    var currentTimes int
-    for {
-        err := p.UnsafePush(data)
+    // 串行化：同一 channel 同时只允许一条 in-flight 消息，保证 tag 匹配语义成立
+    p.pushMu.Lock()
+    defer p.pushMu.Unlock()
+
+    for attempt := 1; ; attempt++ {
+        if !p.isConnected {
+            return errNotConnected
+        }
+
+        // 清掉上一次超时重发遗留的陈旧确认
+        p.drainConfirms()
+
+        tag, err := p.publish(data)
         if err != nil {
             p.logger.Printf("[go-rabbitmq] Push failed [err=%s]. Retrying...", err.Error())
-
-            currentTimes += 1
-            if currentTimes < resendTimes {
-                time.Sleep(reconnectDelay)
-                continue
-            } else {
+            if attempt >= resendTimes {
                 return err
             }
+            time.Sleep(reconnectDelay)
+            continue
         }
 
-        // Wait for confirmation
-        ticker := time.NewTicker(resendDelay)
-        select {
-        case confirm := <-p.notifyConfirm:
-            if confirm.Ack {
-                // p.logger.Println("[go-rabbitmq] Push confirmed delivery with delivery tag: %d", confirm.DeliveryTag)
-                return nil
-            }
-        case <-ticker.C:
+        acked, ok := p.waitConfirm(tag, resendDelay)
+        switch {
+        case ok && acked:
+            return nil
+        case !ok:
+            p.logger.Println("[go-rabbitmq] Push didn't confirm. Retrying...")
+        default:
+            p.logger.Println("[go-rabbitmq] Push nacked by broker. Retrying...")
         }
 
-        p.logger.Println("[go-rabbitmq] Push didn't confirm. Retrying...")
+        if attempt >= resendTimes {
+            return errPushException
+        }
     }
 }
 
-// UnsafePush will push to the queue without checking for
-// confirmation. It returns an error if it fails to connect.
-// No guarantees are provided for whether the server will
-// recieve the message.
-func (p *Producer) UnsafePush(data []byte) error {
-    if !p.isConnected {
-        return errNotConnected
+// waitConfirm 等待与 tag 匹配的确认。返回 (是否 Ack, 是否收到确认)。
+// 未匹配的确认（陈旧 tag）直接丢弃，不参与本次判定。
+func (p *Producer) waitConfirm(tag uint64, timeout time.Duration) (acked bool, got bool) {
+    timer := time.NewTimer(timeout)
+    defer timer.Stop()
+
+    for {
+        select {
+        case confirm, ok := <-p.notifyConfirm:
+            if !ok {
+                return false, false
+            }
+            if confirm.DeliveryTag != tag {
+                continue
+            }
+            return confirm.Ack, true
+        case <-timer.C:
+            return false, false
+        case <-p.done:
+            return false, false
+        }
+    }
+}
+
+// drainConfirms 非阻塞排空确认通道，防止陈旧确认占用缓冲/阻塞连接分发。
+func (p *Producer) drainConfirms() {
+    for {
+        select {
+        case _, ok := <-p.notifyConfirm:
+            if !ok {
+                return
+            }
+        default:
+            return
+        }
+    }
+}
+
+// publish 在持 pushMu 的前提下发布并返回本次消息的 delivery tag。
+func (p *Producer) publish(data []byte) (uint64, error) {
+    ch := p.channel
+    if ch == nil {
+        return 0, errNotConnected
     }
 
-    return p.channel.Publish(
+    if err := ch.Publish(
         p.exchange,  // Exchange
         p.routerKey, // Routing key
         false,       // Mandatory
@@ -357,7 +414,28 @@ func (p *Producer) UnsafePush(data []byte) error {
             Priority:        0,               // 0-9
             Timestamp:       time.Now(),
         },
-    )
+    ); err != nil {
+        return 0, err
+    }
+
+    p.tagGen++
+    return p.tagGen, nil
+}
+
+// UnsafePush will push to the queue without checking for
+// confirmation. It returns an error if it fails to connect.
+// No guarantees are provided for whether the server will
+// recieve the message.
+func (p *Producer) UnsafePush(data []byte) error {
+    if !p.isConnected {
+        return errNotConnected
+    }
+
+    p.pushMu.Lock()
+    defer p.pushMu.Unlock()
+
+    _, err := p.publish(data)
+    return err
 }
 
 // Close will cleanly shutdown the channel and connection.
