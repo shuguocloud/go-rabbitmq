@@ -84,6 +84,11 @@ const (
 
     // Audit 039：Push 在建连/重连窗口内等待就绪的上限（覆盖启动首连与 reconnectDelay 抖动）
     pushReadyTimeout = 10 * time.Second
+
+    // Audit 046：NotifyClose 通道缓冲。streadway 的 Connection.shutdown / Channel.shutdown
+    // 持有连接（通道）锁同步投递通知，无缓冲时若此刻无接收者（如 init 执行期间）
+    // 会阻塞投递，进而让 init 错误分支里的 Close() 卡在 destructor.Do 上，重连协程死锁。
+    notifyBufferSize = 1
 )
 
 var (
@@ -340,7 +345,7 @@ func (p *Producer) init(conn *amqp.Connection) error {
     ch, err := conn.Channel()
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to open a channel.", err.Error())
-        conn.Close()
+        // Audit 046：此处不关闭 conn，交给 handleReconnect 的 closeStaleConnection 回收。
         return err
     }
 
@@ -348,7 +353,8 @@ func (p *Producer) init(conn *amqp.Connection) error {
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to confirm a channel.", err.Error())
         ch.Close()
-        conn.Close()
+        // Audit 046：不在此关闭 conn（连接已断时 Close 会阻塞在 streadway 的
+        // destructor.Do 上等待 reader 的 shutdown 完成），交由外层重连循环回收。
         return err
     }
 
@@ -364,7 +370,8 @@ func (p *Producer) init(conn *amqp.Connection) error {
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to declare a exchange.", err.Error())
         ch.Close()
-        conn.Close()
+        // Audit 046：不在此关闭 conn（连接已断时 Close 会阻塞在 streadway 的
+        // destructor.Do 上等待 reader 的 shutdown 完成），交由外层重连循环回收。
         return err
     }
 
@@ -379,7 +386,8 @@ func (p *Producer) init(conn *amqp.Connection) error {
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to declare a queue.", err.Error())
         ch.Close()
-        conn.Close()
+        // Audit 046：不在此关闭 conn（连接已断时 Close 会阻塞在 streadway 的
+        // destructor.Do 上等待 reader 的 shutdown 完成），交由外层重连循环回收。
         return err
     }
 
@@ -393,7 +401,8 @@ func (p *Producer) init(conn *amqp.Connection) error {
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to bind a queue.", err.Error())
         ch.Close()
-        conn.Close()
+        // Audit 046：不在此关闭 conn（连接已断时 Close 会阻塞在 streadway 的
+        // destructor.Do 上等待 reader 的 shutdown 完成），交由外层重连循环回收。
         return err
     }
 
@@ -414,7 +423,8 @@ func (p *Producer) closeStaleConnection() {
 // changeConnection takes a new connection to the queue,
 // and updates the close listener to reflect this.
 func (p *Producer) changeConnection(connection *amqp.Connection) {
-    notifyConnClose := make(chan *amqp.Error)
+    // Audit 046：带缓冲，保证 streadway 的 shutdown 同步投递不会因无接收者而阻塞。
+    notifyConnClose := make(chan *amqp.Error, notifyBufferSize)
 
     p.stateMu.Lock()
     p.connection = connection
@@ -430,7 +440,8 @@ func (p *Producer) changeChannel(channel *amqp.Channel) {
     p.pushMu.Lock()
     defer p.pushMu.Unlock()
 
-    notifyChanClose := make(chan *amqp.Error)
+    // Audit 046：带缓冲，保证 Channel.shutdown 同步投递不会卡住 connection reader。
+    notifyChanClose := make(chan *amqp.Error, notifyBufferSize)
     notifyConfirm := make(chan amqp.Confirmation, confirmBufferSize)
 
     p.stateMu.Lock()
