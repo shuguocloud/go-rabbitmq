@@ -108,6 +108,7 @@ func IsAlreadyClosed(err error) bool {
 
 // New creates a new consumer state instance, and automatically
 // attempts to connect to the server.
+// Audit 052：必填参数非法时返回 nil 且不启动重连协程，调用方需按 nil 判定配置错误。
 func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool, headers amqp.Table, contentType string, heartbeat int64) *Producer {
     p := Producer{
         addr:         addr,
@@ -124,6 +125,11 @@ func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool
         readyCh:      make(chan struct{}),
     }
 
+    if err := p.validateConfig(); err != nil {
+        p.logger.Printf("[go-rabbitmq] Invalid producer config [err=%s], producer disabled.", err.Error())
+        return nil
+    }
+
     p.reconnect.Add(1)
     go func() {
         defer p.reconnect.Done()
@@ -131,6 +137,25 @@ func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool
     }()
 
     return &p
+}
+
+// validateConfig 校验建连与声明/绑定所需的必填参数（Audit 052）。
+// 这些字段为空时 init 必然失败，producer 会陷入 reconnectDelay/reInitDelay 无意义重拨，
+// 既刷日志又让每次 Push 白等 pushReadyTimeout，故在构造期直接拒绝。
+func (p *Producer) validateConfig() error {
+    switch {
+    case p.addr == "":
+        return errors.New("addr is empty")
+    case p.exchange == "":
+        return errors.New("exchange is empty")
+    case p.exchangeType == "":
+        return errors.New("exchangeType is empty")
+    case p.queue == "":
+        return errors.New("queue is empty")
+    case p.routerKey == "":
+        return errors.New("routerKey is empty")
+    }
+    return nil
 }
 
 // 判断连接是否断开
