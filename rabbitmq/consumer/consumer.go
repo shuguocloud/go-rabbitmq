@@ -142,6 +142,7 @@ type Consumer struct {
     logger Logger
 }
 
+// Audit 056：必填参数非法时返回 nil，调用方需按 nil 判定配置错误（与 producer Audit 052 一致）。
 func New(addr, consumerTag, exchange, exchangeType, queue, routerKey string, handler func([]byte) error, bindingMode bool, heartbeat int64, opts ...Option) *Consumer {
     consumer := &Consumer{
         addr:             addr,
@@ -163,7 +164,33 @@ func New(addr, consumerTag, exchange, exchangeType, queue, routerKey string, han
         opt(consumer)
     }
 
+    if err := consumer.validateConfig(); err != nil {
+        consumer.logger.Errorf("[go-rabbitmq] Invalid consumer config [err=%s], consumer disabled.", err.Error())
+        return nil
+    }
+
     return consumer
+}
+
+// validateConfig 校验必填参数。addr/exchange/queue 等为空会在 Start/重连时
+// 无限空转刷日志；handler 为 nil 会在消费时逐消息 panic（Audit 035 的 recover
+// 会把它转成无限 Nack/requeue 循环），必须在构造期前置拦截。
+func (c *Consumer) validateConfig() error {
+    switch {
+    case c.addr == "":
+        return errors.New("addr is empty")
+    case c.exchange == "":
+        return errors.New("exchange is empty")
+    case c.exchangeType == "":
+        return errors.New("exchangeType is empty")
+    case c.queue == "":
+        return errors.New("queue is empty")
+    case c.routerKey == "":
+        return errors.New("routerKey is empty")
+    case c.handler == nil:
+        return errors.New("handler is nil")
+    }
+    return nil
 }
 
 // 首次连接rabbitmq，有错即返回
@@ -421,6 +448,9 @@ func (c *Consumer) reconnect() {
     for {
         connNotify, channelNotify, cancelNotify := c.notifyChans()
 
+        // Audit 058：标记本次重建是否由 broker 主动 cancel 触发。
+        cancelledByBroker := false
+
         select {
         case <-c.done:
             return
@@ -439,6 +469,7 @@ func (c *Consumer) reconnect() {
             // passiveBinding 会持续失败重试，直到运维恢复，属于正确行为）。
             if ok {
                 c.logger.Errorf("[go-rabbitmq] rabbitmq consumer - cancelled by broker [tag=%s]. Re-subscribing...", tag)
+                cancelledByBroker = true
             }
         }
 
@@ -447,7 +478,7 @@ func (c *Consumer) reconnect() {
             return
         }
 
-        c.closeStale()
+        c.closeStale(cancelledByBroker)
         // Audit 045：通知通道已改为带缓冲且此处非阻塞排空，避免 shutdown
         // 同步投递时因无人接收而阻塞，导致死连接无法释放。
         c.drainNotify(channelNotify, "channel")
@@ -497,7 +528,10 @@ func (c *Consumer) reconnect() {
 }
 
 // closeStale 关闭上一轮仍存活的 channel/连接（channel 级异常时连接可能仍存活）。
-func (c *Consumer) closeStale() {
+// skipCancel 为 true 时跳过 basic.cancel（Audit 058）：进入路径是 broker 主动
+// cancel（Audit 053），consumerTag 在 broker 侧已失效，再发 basic.cancel 只会
+// 收到 channel 异常 404，每次固定刷一条误导排障的 Errorf。
+func (c *Consumer) closeStale(skipCancel bool) {
     conn := c.currentConnection()
     ch := c.currentChannel()
 
@@ -506,9 +540,11 @@ func (c *Consumer) closeStale() {
     }
 
     if ch != nil {
-        // 关闭 SubMsg common delivery
-        if err := ch.Cancel(c.consumerTag, true); err != nil {
-            c.logger.Errorf("[go-rabbitmq] rabbitmq consumer - channel cancel failed: %s", err.Error())
+        if !skipCancel {
+            // 关闭 SubMsg common delivery
+            if err := ch.Cancel(c.consumerTag, true); err != nil {
+                c.logger.Errorf("[go-rabbitmq] rabbitmq consumer - channel cancel failed: %s", err.Error())
+            }
         }
         if err := ch.Close(); err != nil {
             c.logger.Errorf("[go-rabbitmq] rabbitmq consumer - channel close failed: %s", err.Error())
