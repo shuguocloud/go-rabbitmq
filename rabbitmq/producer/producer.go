@@ -5,6 +5,7 @@ import (
     "log"
     "os"
     "sync"
+    "sync/atomic"
     "time"
 
     "github.com/streadway/amqp"
@@ -45,6 +46,12 @@ type Producer struct {
     // goroutine 并发读写，统一由 stateMu 保护。锁序固定为 pushMu → stateMu。
     stateMu sync.RWMutex
 
+    // Audit 033：生命周期状态机。closing 保证 Close 幂等且重连循环能感知退出；
+    // doneOnce 保护 close(done)；wg 跟踪重连 goroutine，Close 时等待其退出。
+    closing   int32
+    doneOnce  sync.Once
+    reconnect sync.WaitGroup
+
     logger *log.Logger
 }
 
@@ -67,6 +74,9 @@ const (
     // Audit 030：确认通道缓冲。streadway 的 confirms 在连接 reader goroutine 中
     // 向 listener 同步投递，缓冲过小（原为 1）会阻塞整个连接的帧分发。
     confirmBufferSize = 256
+
+    // Audit 033：Close 等待重连 goroutine 退出的上限（Dial 最坏 30s，不能拖住进程退出）
+    closeWaitTimeout = 5 * time.Second
 )
 
 var (
@@ -93,7 +103,11 @@ func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool
         done:         make(chan bool),
     }
 
-    go p.handleReconnect(addr)
+    p.reconnect.Add(1)
+    go func() {
+        defer p.reconnect.Done()
+        p.handleReconnect(addr)
+    }()
 
     return &p
 }
@@ -155,6 +169,11 @@ func (p *Producer) confirmChan() chan amqp.Confirmation {
 // notifyConnClose, and then continuously attempt to reconnect.
 func (p *Producer) handleReconnect(addr string) {
     for {
+        // Audit 033：Close 已开始时不再建连，避免留下无主连接
+        if p.isClosing() {
+            return
+        }
+
         p.setConnected(false)
 
         // Audit 032：重拨前必须清理上一轮连接。channel 级异常（queue 被删、
@@ -177,6 +196,9 @@ func (p *Producer) handleReconnect(addr string) {
         }
 
         if done := p.handleReInit(conn); done {
+            // Audit 033：因关闭流程退出时，本次新建的连接必须回收，
+            // 否则 Close 之后仍会留下一条无人管理的连接。
+            conn.Close()
             break
         }
     }
@@ -212,6 +234,10 @@ func (p *Producer) connect(addr string) (*amqp.Connection, error) {
 // and then continuously attempt to re-initialize both channels
 func (p *Producer) handleReInit(conn *amqp.Connection) bool {
     for {
+        if p.isClosing() {
+            return true
+        }
+
         p.setConnected(false)
 
         err := p.init(conn)
@@ -486,24 +512,55 @@ func (p *Producer) UnsafePush(data []byte) error {
 }
 
 // Close will cleanly shutdown the channel and connection.
+// Audit 033：幂等（重复调用返回 errAlreadyClosed 而非 panic），并等待重连
+// goroutine 退出，避免 Close 之后仍有连接被建立成"无主连接"。
 func (p *Producer) Close() error {
-    if !p.connected() {
+    if !atomic.CompareAndSwapInt32(&p.closing, 0, 1) {
         return errAlreadyClosed
     }
 
+    var err error
     if ch := p.currentChannel(); ch != nil {
-        if err := ch.Close(); err != nil {
-            return err
+        if cerr := ch.Close(); cerr != nil {
+            err = cerr
         }
     }
-
     if conn := p.currentConnection(); conn != nil {
-        if err := conn.Close(); err != nil {
-            return err
+        if cerr := conn.Close(); cerr != nil && err == nil {
+            err = cerr
         }
     }
 
-    close(p.done)
+    p.closeDone()
     p.setConnected(false)
-    return nil
+    p.waitReconnectExit()
+
+    return err
+}
+
+// isClosing 报告是否已进入关闭流程。
+func (p *Producer) isClosing() bool {
+    return atomic.LoadInt32(&p.closing) == 1
+}
+
+// closeDone 幂等关闭 done 通道（WaitGroup/Push 等据此退出）。
+func (p *Producer) closeDone() {
+    p.doneOnce.Do(func() {
+        close(p.done)
+    })
+}
+
+// waitReconnectExit 等待重连 goroutine 退出，最多 closeWaitTimeout。
+func (p *Producer) waitReconnectExit() {
+    exited := make(chan struct{})
+    go func() {
+        p.reconnect.Wait()
+        close(exited)
+    }()
+
+    select {
+    case <-exited:
+    case <-time.After(closeWaitTimeout):
+        p.logger.Println("[go-rabbitmq] reconnect goroutine did not exit before timeout.")
+    }
 }
