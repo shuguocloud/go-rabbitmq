@@ -46,6 +46,10 @@ type Producer struct {
     // goroutine 并发读写，统一由 stateMu 保护。锁序固定为 pushMu → stateMu。
     stateMu sync.RWMutex
 
+    // Audit 039：建连就绪信号。未连接时 readyCh 非 nil，init 成功后关闭并置 nil；
+    // 断线时重新创建，供 WaitReady/Push 在建连窗口内等待而不是直接失败丢消息。
+    readyCh chan struct{}
+
     // Audit 033：生命周期状态机。closing 保证 Close 幂等且重连循环能感知退出；
     // doneOnce 保护 close(done)；wg 跟踪重连 goroutine，Close 时等待其退出。
     closing   int32
@@ -77,6 +81,9 @@ const (
 
     // Audit 033：Close 等待重连 goroutine 退出的上限（Dial 最坏 30s，不能拖住进程退出）
     closeWaitTimeout = 5 * time.Second
+
+    // Audit 039：Push 在建连/重连窗口内等待就绪的上限（覆盖启动首连与 reconnectDelay 抖动）
+    pushReadyTimeout = 10 * time.Second
 )
 
 var (
@@ -101,6 +108,7 @@ func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool
         heartbeat:    heartbeat,
         logger:       log.New(os.Stdout, "", log.LstdFlags),
         done:         make(chan bool),
+        readyCh:      make(chan struct{}),
     }
 
     p.reconnect.Add(1)
@@ -123,10 +131,65 @@ func (p *Producer) IsClosed() bool {
 
 // setConnected / connected / currentConnection / currentChannel / connCloseChan /
 // chanCloseChan / confirmChan 统一封装状态字段的并发安全访问（Audit 031）。
+//
+// Audit 039：状态切换同时驱动就绪信号——转为已连接时关闭 readyCh 唤醒等待者，
+// 转为未连接时重建 readyCh，供后续 WaitReady 等待下一次建连。
 func (p *Producer) setConnected(v bool) {
     p.stateMu.Lock()
-    p.isConnected = v
+    if v {
+        p.isConnected = true
+        if p.readyCh != nil {
+            close(p.readyCh)
+            p.readyCh = nil
+        }
+    } else {
+        p.isConnected = false
+        if p.readyCh == nil {
+            p.readyCh = make(chan struct{})
+        }
+    }
     p.stateMu.Unlock()
+}
+
+// WaitReady 等待连接就绪，最长 timeout；就绪返回 true，期间 Close 或超时返回 false。
+func (p *Producer) WaitReady(timeout time.Duration) bool {
+    p.stateMu.RLock()
+    if p.isConnected {
+        p.stateMu.RUnlock()
+        return true
+    }
+    ready := p.readyCh
+    p.stateMu.RUnlock()
+
+    if ready == nil {
+        return p.connected()
+    }
+
+    timer := time.NewTimer(timeout)
+    defer timer.Stop()
+
+    select {
+    case <-ready:
+        return true
+    case <-p.done:
+        return false
+    case <-timer.C:
+        return false
+    }
+}
+
+// Usable 报告 producer 是否仍可复用：连接存活，或仍在建连/重连且未被 Close。
+// 与 IsClosed 的区别是"conn 尚未登记"（首次建连/重连的 Dial 窗口）不算失效，
+// 避免业务侧把正在建连的实例误判为断开而反复重建（Audit 039）。
+func (p *Producer) Usable() bool {
+    if p.isClosing() {
+        return false
+    }
+    if p.connected() {
+        return true
+    }
+    conn := p.currentConnection()
+    return conn == nil || !conn.IsClosed()
 }
 
 func (p *Producer) connected() bool {
@@ -385,7 +448,9 @@ func (p *Producer) changeChannel(channel *amqp.Channel) {
 // 若超时未确认则重发，最多 resendTimes 次；仅当收到与本次发布 DeliveryTag
 // 匹配的 Ack 才视为成功，避免陈旧确认导致的"假成功丢消息"。
 func (p *Producer) Push(data []byte) error {
-    if !p.connected() {
+    // Audit 039：New 为异步建连，启动/断线窗口内直接返回 errNotConnected 会丢消息；
+    // 此处先等待就绪（上限 pushReadyTimeout），仍不就绪才失败。
+    if !p.connected() && !p.WaitReady(pushReadyTimeout) {
         return errNotConnected
     }
 
