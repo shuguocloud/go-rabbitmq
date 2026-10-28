@@ -157,6 +157,11 @@ func (p *Producer) handleReconnect(addr string) {
     for {
         p.setConnected(false)
 
+        // Audit 032：重拨前必须清理上一轮连接。channel 级异常（queue 被删、
+        // 权限变更、PRECONDITION_FAILED 等）时连接本身可能仍存活，
+        // 不关闭会随每次 channel 错误泄漏一条 TCP 连接。
+        p.closeStaleConnection()
+
         p.logger.Println("[go-rabbitmq] Attempt to connect.")
 
         conn, err := p.connect(addr)
@@ -246,15 +251,15 @@ func (p *Producer) init(conn *amqp.Connection) error {
     ch, err := conn.Channel()
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to open a channel.", err.Error())
-        p.closeStaleConnection()
+        conn.Close()
         return err
     }
 
     err = ch.Confirm(false)
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to confirm a channel.", err.Error())
-        p.closeStaleChannel()
-        p.closeStaleConnection()
+        ch.Close()
+        conn.Close()
         return err
     }
 
@@ -269,8 +274,8 @@ func (p *Producer) init(conn *amqp.Connection) error {
     )
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to declare a exchange.", err.Error())
-        p.closeStaleChannel()
-        p.closeStaleConnection()
+        ch.Close()
+        conn.Close()
         return err
     }
 
@@ -284,8 +289,8 @@ func (p *Producer) init(conn *amqp.Connection) error {
     )
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to declare a queue.", err.Error())
-        p.closeStaleChannel()
-        p.closeStaleConnection()
+        ch.Close()
+        conn.Close()
         return err
     }
 
@@ -298,8 +303,8 @@ func (p *Producer) init(conn *amqp.Connection) error {
     )
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to bind a queue.", err.Error())
-        p.closeStaleChannel()
-        p.closeStaleConnection()
+        ch.Close()
+        conn.Close()
         return err
     }
 
@@ -308,13 +313,6 @@ func (p *Producer) init(conn *amqp.Connection) error {
     p.logger.Println("[go-rabbitmq] Setup!")
 
     return nil
-}
-
-// closeStaleChannel 关闭当前登记的 channel（stateMu 保护，nil 安全）。
-func (p *Producer) closeStaleChannel() {
-    if ch := p.currentChannel(); ch != nil {
-        ch.Close()
-    }
 }
 
 // closeStaleConnection 关闭当前登记的 connection（stateMu 保护，nil 安全）。
