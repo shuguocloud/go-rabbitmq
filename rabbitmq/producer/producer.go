@@ -457,15 +457,30 @@ func (p *Producer) init(conn *amqp.Connection) error {
         return err
     }
 
-    err = ch.ExchangeDeclare(
-        p.exchange,
-        p.exchangeType,
-        true,
-        false,
-        false,
-        false,
-        nil,
-    )
+    // Audit 038：bindingMode 接线——true 主动声明（自动创建 exchange/queue），
+    // false 被动声明（仅校验存在性，不创建不修改，供运维侧预建并收紧 declare
+    // 权限的部署使用；实体不存在时 passive declare 返回 404，走外层重连重试）。
+    if p.bindingMode {
+        err = ch.ExchangeDeclare(
+            p.exchange,
+            p.exchangeType,
+            true,
+            false,
+            false,
+            false,
+            nil,
+        )
+    } else {
+        err = ch.ExchangeDeclarePassive(
+            p.exchange,
+            p.exchangeType,
+            true,
+            false,
+            false,
+            false,
+            nil,
+        )
+    }
     if err != nil {
         p.logger.Errorf("[go-rabbitmq] Failed [err=%s] to declare a exchange.", err.Error())
         ch.Close()
@@ -474,14 +489,25 @@ func (p *Producer) init(conn *amqp.Connection) error {
         return err
     }
 
-    _, err = ch.QueueDeclare(
-        p.queue,
-        true,  // Durable
-        false, // Delete when unused
-        false, // Exclusive
-        false, // No-wait
-        nil,   // Arguments
-    )
+    if p.bindingMode {
+        _, err = ch.QueueDeclare(
+            p.queue,
+            true,  // Durable
+            false, // Delete when unused
+            false, // Exclusive
+            false, // No-wait
+            nil,   // Arguments
+        )
+    } else {
+        _, err = ch.QueueDeclarePassive(
+            p.queue,
+            true,  // Durable
+            false, // Delete when unused
+            false, // Exclusive
+            false, // No-wait
+            nil,   // Arguments
+        )
+    }
     if err != nil {
         p.logger.Errorf("[go-rabbitmq] Failed [err=%s] to declare a queue.", err.Error())
         ch.Close()
@@ -490,6 +516,7 @@ func (p *Producer) init(conn *amqp.Connection) error {
         return err
     }
 
+    // AMQP 无 passive bind：QueueBind 对已存在的绑定是幂等空操作，两种模式共用。
     err = ch.QueueBind(
         p.queue,
         p.routerKey,
