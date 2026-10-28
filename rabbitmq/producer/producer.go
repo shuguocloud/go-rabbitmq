@@ -4,7 +4,6 @@ import (
     "context"
     "errors"
     "log"
-    "os"
     "sync"
     "sync/atomic"
     "time"
@@ -57,7 +56,37 @@ type Producer struct {
     doneOnce  sync.Once
     reconnect sync.WaitGroup
 
-    logger *log.Logger
+    logger Logger
+}
+
+// Logger 是 producer 的最小日志抽象（Audit 050）。默认实现写标准库 log，
+// 项目侧可通过 WithLogger 注入 logx 实现，使 MQ 日志进入统一分级/采集链路。
+type Logger interface {
+    Infof(format string, args ...interface{})
+    Errorf(format string, args ...interface{})
+}
+
+// stdLogger 默认日志实现，保持上游"直接写标准输出"的行为，供独立使用场景兜底。
+type stdLogger struct{}
+
+func (stdLogger) Infof(format string, args ...interface{}) {
+    log.Printf(format, args...)
+}
+
+func (stdLogger) Errorf(format string, args ...interface{}) {
+    log.Printf(format, args...)
+}
+
+// Option 用于覆盖 Producer 的内部依赖（Audit 050）。
+type Option func(*Producer)
+
+// WithLogger 注入自定义日志实现；传 nil 时保持默认。
+func WithLogger(l Logger) Option {
+    return func(p *Producer) {
+        if l != nil {
+            p.logger = l
+        }
+    }
 }
 
 const (
@@ -90,6 +119,10 @@ const (
     // 持有连接（通道）锁同步投递通知，无缓冲时若此刻无接收者（如 init 执行期间）
     // 会阻塞投递，进而让 init 错误分支里的 Close() 卡在 destructor.Do 上，重连协程死锁。
     notifyBufferSize = 1
+
+    // Audit 050：重连失败日志节流。重连风暴时每 reconnectDelay=5s 打印两条日志，
+    // 此处仅在首次失败与每 reconnectLogEvery 次（约 1 分钟）后打印，其余静默。
+    reconnectLogEvery = 12
 )
 
 var (
@@ -109,7 +142,7 @@ func IsAlreadyClosed(err error) bool {
 // New creates a new consumer state instance, and automatically
 // attempts to connect to the server.
 // Audit 052：必填参数非法时返回 nil 且不启动重连协程，调用方需按 nil 判定配置错误。
-func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool, headers amqp.Table, contentType string, heartbeat int64) *Producer {
+func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool, headers amqp.Table, contentType string, heartbeat int64, opts ...Option) *Producer {
     p := Producer{
         addr:         addr,
         exchange:     exchange,
@@ -120,13 +153,17 @@ func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool
         bindingMode:  bindingMode,
         headers:      headers,
         heartbeat:    heartbeat,
-        logger:       log.New(os.Stdout, "", log.LstdFlags),
+        logger:       stdLogger{},
         done:         make(chan bool),
         readyCh:      make(chan struct{}),
     }
 
+    for _, opt := range opts {
+        opt(&p)
+    }
+
     if err := p.validateConfig(); err != nil {
-        p.logger.Printf("[go-rabbitmq] Invalid producer config [err=%s], producer disabled.", err.Error())
+        p.logger.Errorf("[go-rabbitmq] Invalid producer config [err=%s], producer disabled.", err.Error())
         return nil
     }
 
@@ -276,6 +313,7 @@ func (p *Producer) confirmChan() chan amqp.Confirmation {
 // handleReconnect will wait for a connection error on
 // notifyConnClose, and then continuously attempt to reconnect.
 func (p *Producer) handleReconnect(addr string) {
+    attempts := 0
     for {
         // Audit 033：Close 已开始时不再建连，避免留下无主连接
         if p.isClosing() {
@@ -289,11 +327,18 @@ func (p *Producer) handleReconnect(addr string) {
         // 不关闭会随每次 channel 错误泄漏一条 TCP 连接。
         p.closeStaleConnection()
 
-        p.logger.Println("[go-rabbitmq] Attempt to connect.")
+        attempts++
+        // Audit 050：重连风暴节流——仅首次失败与每 reconnectLogEvery 次打印，
+        // 避免 broker 长时间不可用时每 5s 刷日志。
+        if attempts == 1 || attempts%reconnectLogEvery == 0 {
+            p.logger.Infof("[go-rabbitmq] Attempt to connect. (attempt %d)", attempts)
+        }
 
         conn, err := p.connect(addr)
         if err != nil {
-            p.logger.Println("[go-rabbitmq] Failed to connect. Retrying...")
+            if attempts == 1 || attempts%reconnectLogEvery == 0 {
+                p.logger.Errorf("[go-rabbitmq] Failed to connect [err=%s]. Retrying...", err.Error())
+            }
 
             select {
             case <-p.done:
@@ -302,6 +347,8 @@ func (p *Producer) handleReconnect(addr string) {
             }
             continue
         }
+
+        attempts = 0
 
         if done := p.handleReInit(conn); done {
             // Audit 033：因关闭流程退出时，本次新建的连接必须回收，
@@ -327,14 +374,14 @@ func (p *Producer) connect(addr string) (*amqp.Connection, error) {
     })
 
     if err != nil {
-        p.logger.Println("[go-rabbitmq] Failed to connect:", err.Error())
+        // Audit 050：失败原因由 handleReconnect 按节流策略统一打印，此处不重复输出。
         return nil, err
     }
 
     //defer conn.Close()
 
     p.changeConnection(conn)
-    p.logger.Println("[go-rabbitmq] Connected!")
+    p.logger.Infof("[go-rabbitmq] Connected!")
     return conn, nil
 }
 
@@ -352,14 +399,14 @@ func (p *Producer) handleReInit(conn *amqp.Connection) bool {
         if err != nil {
             // Audit 051：init 失败原因与该连接是否已关闭是两回事，分开记录，
             // 避免把 init 错误当成"连接关闭原因"误导排障。
-            p.logger.Printf("[go-rabbitmq] Failed to initialize channel [err=%s]. Retrying...", err.Error())
+            p.logger.Errorf("[go-rabbitmq] Failed to initialize channel [err=%s]. Retrying...", err.Error())
 
             select {
             case <-p.done:
                 return true
             case e := <-p.connCloseChan():
                 if e != nil {
-                    p.logger.Printf("[go-rabbitmq] Connection closed [err=%s]. Reconnecting...", e.Error())
+                    p.logger.Errorf("[go-rabbitmq] Connection closed [err=%s]. Reconnecting...", e.Error())
                 }
                 return false
             case <-time.After(reInitDelay):
@@ -372,12 +419,12 @@ func (p *Producer) handleReInit(conn *amqp.Connection) bool {
             return true
         case err := <-p.connCloseChan():
             if err != nil {
-                p.logger.Printf("[go-rabbitmq] Connection closed [err=%s]. Reconnecting...", err.Error())
+                p.logger.Errorf("[go-rabbitmq] Connection closed [err=%s]. Reconnecting...", err.Error())
             }
             return false
         case err := <-p.chanCloseChan():
             if err != nil {
-                p.logger.Printf("[go-rabbitmq] Channel closed [err=%s]. Re-running init...", err.Error())
+                p.logger.Errorf("[go-rabbitmq] Channel closed [err=%s]. Re-running init...", err.Error())
             }
             return false
         }
@@ -388,14 +435,14 @@ func (p *Producer) handleReInit(conn *amqp.Connection) bool {
 func (p *Producer) init(conn *amqp.Connection) error {
     ch, err := conn.Channel()
     if err != nil {
-        p.logger.Printf("[go-rabbitmq] Failed [err=%s] to open a channel.", err.Error())
+        p.logger.Errorf("[go-rabbitmq] Failed [err=%s] to open a channel.", err.Error())
         // Audit 046：此处不关闭 conn，交给 handleReconnect 的 closeStaleConnection 回收。
         return err
     }
 
     err = ch.Confirm(false)
     if err != nil {
-        p.logger.Printf("[go-rabbitmq] Failed [err=%s] to confirm a channel.", err.Error())
+        p.logger.Errorf("[go-rabbitmq] Failed [err=%s] to confirm a channel.", err.Error())
         ch.Close()
         // Audit 046：不在此关闭 conn（连接已断时 Close 会阻塞在 streadway 的
         // destructor.Do 上等待 reader 的 shutdown 完成），交由外层重连循环回收。
@@ -412,7 +459,7 @@ func (p *Producer) init(conn *amqp.Connection) error {
         nil,
     )
     if err != nil {
-        p.logger.Printf("[go-rabbitmq] Failed [err=%s] to declare a exchange.", err.Error())
+        p.logger.Errorf("[go-rabbitmq] Failed [err=%s] to declare a exchange.", err.Error())
         ch.Close()
         // Audit 046：不在此关闭 conn（连接已断时 Close 会阻塞在 streadway 的
         // destructor.Do 上等待 reader 的 shutdown 完成），交由外层重连循环回收。
@@ -428,7 +475,7 @@ func (p *Producer) init(conn *amqp.Connection) error {
         nil,   // Arguments
     )
     if err != nil {
-        p.logger.Printf("[go-rabbitmq] Failed [err=%s] to declare a queue.", err.Error())
+        p.logger.Errorf("[go-rabbitmq] Failed [err=%s] to declare a queue.", err.Error())
         ch.Close()
         // Audit 046：不在此关闭 conn（连接已断时 Close 会阻塞在 streadway 的
         // destructor.Do 上等待 reader 的 shutdown 完成），交由外层重连循环回收。
@@ -443,7 +490,7 @@ func (p *Producer) init(conn *amqp.Connection) error {
         nil,
     )
     if err != nil {
-        p.logger.Printf("[go-rabbitmq] Failed [err=%s] to bind a queue.", err.Error())
+        p.logger.Errorf("[go-rabbitmq] Failed [err=%s] to bind a queue.", err.Error())
         ch.Close()
         // Audit 046：不在此关闭 conn（连接已断时 Close 会阻塞在 streadway 的
         // destructor.Do 上等待 reader 的 shutdown 完成），交由外层重连循环回收。
@@ -452,7 +499,7 @@ func (p *Producer) init(conn *amqp.Connection) error {
 
     p.changeChannel(ch)
     p.setConnected(true)
-    p.logger.Println("[go-rabbitmq] Setup!")
+    p.logger.Infof("[go-rabbitmq] Setup!")
 
     return nil
 }
@@ -538,7 +585,7 @@ func (p *Producer) PushWithContext(ctx context.Context, data []byte) error {
 
         tag, err := p.publish(data)
         if err != nil {
-            p.logger.Printf("[go-rabbitmq] Push failed [err=%s]. Retrying...", err.Error())
+            p.logger.Errorf("[go-rabbitmq] Push failed [err=%s]. Retrying...", err.Error())
             if attempt >= resendTimes {
                 return err
             }
@@ -553,9 +600,9 @@ func (p *Producer) PushWithContext(ctx context.Context, data []byte) error {
         case ok && acked:
             return nil
         case !ok:
-            p.logger.Println("[go-rabbitmq] Push didn't confirm. Retrying...")
+            p.logger.Errorf("[go-rabbitmq] Push didn't confirm. Retrying...")
         default:
-            p.logger.Println("[go-rabbitmq] Push nacked by broker. Retrying...")
+            p.logger.Errorf("[go-rabbitmq] Push nacked by broker. Retrying...")
         }
 
         if err := ctx.Err(); err != nil {
@@ -715,6 +762,6 @@ func (p *Producer) waitReconnectExit() {
     select {
     case <-exited:
     case <-time.After(closeWaitTimeout):
-        p.logger.Println("[go-rabbitmq] reconnect goroutine did not exit before timeout.")
+        p.logger.Errorf("[go-rabbitmq] reconnect goroutine did not exit before timeout.")
     }
 }
