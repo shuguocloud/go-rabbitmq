@@ -75,8 +75,11 @@ type Consumer struct {
     channel       *amqp.Channel
     connNotify    chan *amqp.Error
     channelNotify chan *amqp.Error
-    isConnected   bool
-    isConsume     bool
+    // Audit 053：broker 主动 basic.cancel（删 queue/管理端取消订阅）时 streadway
+    // 只投递 NotifyCancel 并关闭 deliveries 通道，不触发 NotifyClose。
+    cancelNotify chan string
+    isConnected  bool
+    isConsume    bool
 
     done chan struct{}
 
@@ -183,10 +186,11 @@ func (c *Consumer) currentChannel() *amqp.Channel {
     return c.channel
 }
 
-func (c *Consumer) notifyChans() (chan *amqp.Error, chan *amqp.Error) {
+// notifyChans 返回连接/通道/取消三条通知通道（Audit 053 新增 cancelNotify）。
+func (c *Consumer) notifyChans() (connNotify, channelNotify chan *amqp.Error, cancelNotify chan string) {
     c.mu.RLock()
     defer c.mu.RUnlock()
-    return c.connNotify, c.channelNotify
+    return c.connNotify, c.channelNotify, c.cancelNotify
 }
 
 func (c *Consumer) connected() bool {
@@ -214,12 +218,13 @@ func (c *Consumer) setConsuming(v bool) {
 }
 
 // applyConnection 在连接、channel、通知通道全部就绪后一次性提交状态。
-func (c *Consumer) applyConnection(conn *amqp.Connection, ch *amqp.Channel, connNotify, channelNotify chan *amqp.Error) {
+func (c *Consumer) applyConnection(conn *amqp.Connection, ch *amqp.Channel, connNotify, channelNotify chan *amqp.Error, cancelNotify chan string) {
     c.mu.Lock()
     c.conn = conn
     c.channel = ch
     c.connNotify = connNotify
     c.channelNotify = channelNotify
+    c.cancelNotify = cancelNotify
     c.isConnected = true
     c.mu.Unlock()
 }
@@ -273,7 +278,10 @@ func (c *Consumer) connect() (err error) {
 
     connNotify := conn.NotifyClose(make(chan *amqp.Error, notifyBufferSize))
     channelNotify := ch.NotifyClose(make(chan *amqp.Error, notifyBufferSize))
-    c.applyConnection(conn, ch, connNotify, channelNotify)
+    // Audit 053：带缓冲——streadway 的 basicCancel 分支向监听者同步投递（c <- m.ConsumerTag），
+    // 无缓冲且无人接收会阻塞 connection reader 的帧分发。
+    cancelNotify := ch.NotifyCancel(make(chan string, notifyBufferSize))
+    c.applyConnection(conn, ch, connNotify, channelNotify, cancelNotify)
 
     // Audit 044：提交后再次确认关闭状态，避免 Close 与本函数交错留下无主连接。
     if c.isClosing() {
@@ -381,7 +389,7 @@ func (c *Consumer) reconnect() {
     defer c.reconnectWg.Done()
 
     for {
-        connNotify, channelNotify := c.notifyChans()
+        connNotify, channelNotify, cancelNotify := c.notifyChans()
 
         select {
         case <-c.done:
@@ -393,6 +401,14 @@ func (c *Consumer) reconnect() {
         case err := <-channelNotify:
             if err != nil {
                 c.logger.Printf("[go-rabbitmq] rabbitmq consumer - channel notify close err=[%s]!", err.Error())
+            }
+        case tag, ok := <-cancelNotify:
+            // Audit 053：broker 主动取消订阅（删 queue/管理端 cancel）不会触发
+            // NotifyClose，只会走这里。不处理则 handle 退出后 isConsume 恒 true、
+            // 消费静默永久停止。按 channel 级异常走既有重建流程（queue 被删时
+            // passiveBinding 会持续失败重试，直到运维恢复，属于正确行为）。
+            if ok {
+                c.logger.Printf("[go-rabbitmq] rabbitmq consumer - cancelled by broker [tag=%s]. Re-subscribing...", tag)
             }
         }
 
@@ -563,6 +579,9 @@ func (c *Consumer) dropConnection() {
 // panic 由 callHandler 单条隔离，消费循环不会因单条消息崩溃而静默停止。
 func (c *Consumer) handle(delivery <-chan amqp.Delivery) {
     defer c.handleWg.Done()
+    // Audit 053：deliveries 通道关闭即消费停止（含 broker 主动 cancel 场景），
+    // 复位状态让 reconnect 能感知"未在消费"。
+    defer c.setConsuming(false)
 
     for d := range delivery {
         c.dispatch(d)
