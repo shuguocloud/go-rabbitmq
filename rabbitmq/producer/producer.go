@@ -41,6 +41,10 @@ type Producer struct {
     pushMu sync.Mutex
     tagGen uint64 // 当前 channel 上已发布的消息序号（等价于 broker 侧 delivery tag）
 
+    // Audit 031：connection/channel/isConnected/notify* 由重连 goroutine 与业务
+    // goroutine 并发读写，统一由 stateMu 保护。锁序固定为 pushMu → stateMu。
+    stateMu sync.RWMutex
+
     logger *log.Logger
 }
 
@@ -96,24 +100,62 @@ func New(addr, exchange, exchangeType, queue, routerKey string, bindingMode bool
 
 // 判断连接是否断开
 func (p *Producer) IsClosed() bool {
-    var isClosed bool
-    if p.connection == nil {
-        isClosed = true
-        p.logger.Println("[go-rabbitmq] rabbitmq has closed!")
+    conn := p.currentConnection()
+    if conn == nil {
+        return true
     }
+    return conn.IsClosed()
+}
 
-    if p.connection != nil && p.connection.IsClosed() {
-        isClosed = true
-        p.logger.Println("[go-rabbitmq] rabbitmq has closed!")
-    }
-    return isClosed
+// setConnected / connected / currentConnection / currentChannel / connCloseChan /
+// chanCloseChan / confirmChan 统一封装状态字段的并发安全访问（Audit 031）。
+func (p *Producer) setConnected(v bool) {
+    p.stateMu.Lock()
+    p.isConnected = v
+    p.stateMu.Unlock()
+}
+
+func (p *Producer) connected() bool {
+    p.stateMu.RLock()
+    defer p.stateMu.RUnlock()
+    return p.isConnected
+}
+
+func (p *Producer) currentConnection() *amqp.Connection {
+    p.stateMu.RLock()
+    defer p.stateMu.RUnlock()
+    return p.connection
+}
+
+func (p *Producer) currentChannel() *amqp.Channel {
+    p.stateMu.RLock()
+    defer p.stateMu.RUnlock()
+    return p.channel
+}
+
+func (p *Producer) connCloseChan() chan *amqp.Error {
+    p.stateMu.RLock()
+    defer p.stateMu.RUnlock()
+    return p.notifyConnClose
+}
+
+func (p *Producer) chanCloseChan() chan *amqp.Error {
+    p.stateMu.RLock()
+    defer p.stateMu.RUnlock()
+    return p.notifyChanClose
+}
+
+func (p *Producer) confirmChan() chan amqp.Confirmation {
+    p.stateMu.RLock()
+    defer p.stateMu.RUnlock()
+    return p.notifyConfirm
 }
 
 // handleReconnect will wait for a connection error on
 // notifyConnClose, and then continuously attempt to reconnect.
 func (p *Producer) handleReconnect(addr string) {
     for {
-        p.isConnected = false
+        p.setConnected(false)
 
         p.logger.Println("[go-rabbitmq] Attempt to connect.")
 
@@ -165,7 +207,7 @@ func (p *Producer) connect(addr string) (*amqp.Connection, error) {
 // and then continuously attempt to re-initialize both channels
 func (p *Producer) handleReInit(conn *amqp.Connection) bool {
     for {
-        p.isConnected = false
+        p.setConnected(false)
 
         err := p.init(conn)
         if err != nil {
@@ -174,7 +216,7 @@ func (p *Producer) handleReInit(conn *amqp.Connection) bool {
             select {
             case <-p.done:
                 return true
-            case <-p.notifyConnClose:
+            case <-p.connCloseChan():
                 p.logger.Printf("[go-rabbitmq] Connection closed [err=%s]. Reconnecting...", err.Error())
                 return false
             case <-time.After(reInitDelay):
@@ -185,12 +227,12 @@ func (p *Producer) handleReInit(conn *amqp.Connection) bool {
         select {
         case <-p.done:
             return true
-        case err := <-p.notifyConnClose:
+        case err := <-p.connCloseChan():
             if err != nil {
                 p.logger.Printf("[go-rabbitmq] Connection closed [err=%s]. Reconnecting...", err.Error())
             }
             return false
-        case err := <-p.notifyChanClose:
+        case err := <-p.chanCloseChan():
             if err != nil {
                 p.logger.Printf("[go-rabbitmq] Channel closed [err=%s]. Re-running init...", err.Error())
             }
@@ -204,21 +246,15 @@ func (p *Producer) init(conn *amqp.Connection) error {
     ch, err := conn.Channel()
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to open a channel.", err.Error())
-        if p.connection != nil {
-            p.connection.Close()
-        }
+        p.closeStaleConnection()
         return err
     }
 
     err = ch.Confirm(false)
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to confirm a channel.", err.Error())
-        if p.channel != nil {
-            p.channel.Close()
-        }
-        if p.connection != nil {
-            p.connection.Close()
-        }
+        p.closeStaleChannel()
+        p.closeStaleConnection()
         return err
     }
 
@@ -233,12 +269,8 @@ func (p *Producer) init(conn *amqp.Connection) error {
     )
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to declare a exchange.", err.Error())
-        if p.channel != nil {
-            p.channel.Close()
-        }
-        if p.connection != nil {
-            p.connection.Close()
-        }
+        p.closeStaleChannel()
+        p.closeStaleConnection()
         return err
     }
 
@@ -252,12 +284,8 @@ func (p *Producer) init(conn *amqp.Connection) error {
     )
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to declare a queue.", err.Error())
-        if p.channel != nil {
-            p.channel.Close()
-        }
-        if p.connection != nil {
-            p.connection.Close()
-        }
+        p.closeStaleChannel()
+        p.closeStaleConnection()
         return err
     }
 
@@ -270,40 +298,60 @@ func (p *Producer) init(conn *amqp.Connection) error {
     )
     if err != nil {
         p.logger.Printf("[go-rabbitmq] Failed [err=%s] to bind a queue.", err.Error())
-        if p.channel != nil {
-            p.channel.Close()
-        }
-        if p.connection != nil {
-            p.connection.Close()
-        }
+        p.closeStaleChannel()
+        p.closeStaleConnection()
         return err
     }
 
     p.changeChannel(ch)
-    p.isConnected = true
+    p.setConnected(true)
     p.logger.Println("[go-rabbitmq] Setup!")
 
     return nil
 }
 
+// closeStaleChannel 关闭当前登记的 channel（stateMu 保护，nil 安全）。
+func (p *Producer) closeStaleChannel() {
+    if ch := p.currentChannel(); ch != nil {
+        ch.Close()
+    }
+}
+
+// closeStaleConnection 关闭当前登记的 connection（stateMu 保护，nil 安全）。
+func (p *Producer) closeStaleConnection() {
+    if conn := p.currentConnection(); conn != nil {
+        conn.Close()
+    }
+}
+
 // changeConnection takes a new connection to the queue,
 // and updates the close listener to reflect this.
 func (p *Producer) changeConnection(connection *amqp.Connection) {
+    notifyConnClose := make(chan *amqp.Error)
+
+    p.stateMu.Lock()
     p.connection = connection
-    p.notifyConnClose = make(chan *amqp.Error)
-    p.connection.NotifyClose(p.notifyConnClose)
+    p.notifyConnClose = notifyConnClose
+    p.stateMu.Unlock()
+
+    connection.NotifyClose(notifyConnClose)
 }
 
 // changeChannel takes a new channel to the queue,
 // and updates the channel listeners to reflect this.
 func (p *Producer) changeChannel(channel *amqp.Channel) {
     p.pushMu.Lock()
+    defer p.pushMu.Unlock()
+
+    notifyChanClose := make(chan *amqp.Error)
+    notifyConfirm := make(chan amqp.Confirmation, confirmBufferSize)
+
+    p.stateMu.Lock()
     p.tagGen = 0 // 新 channel 的 delivery tag 从 1 重新计数
     p.channel = channel
-    p.notifyChanClose = make(chan *amqp.Error)
-    p.notifyConfirm = make(chan amqp.Confirmation, confirmBufferSize)
-    notifyChanClose, notifyConfirm := p.notifyChanClose, p.notifyConfirm
-    p.pushMu.Unlock()
+    p.notifyChanClose = notifyChanClose
+    p.notifyConfirm = notifyConfirm
+    p.stateMu.Unlock()
 
     channel.NotifyClose(notifyChanClose)
     channel.NotifyPublish(notifyConfirm)
@@ -313,7 +361,7 @@ func (p *Producer) changeChannel(channel *amqp.Channel) {
 // 若超时未确认则重发，最多 resendTimes 次；仅当收到与本次发布 DeliveryTag
 // 匹配的 Ack 才视为成功，避免陈旧确认导致的"假成功丢消息"。
 func (p *Producer) Push(data []byte) error {
-    if !p.isConnected {
+    if !p.connected() {
         return errNotConnected
     }
 
@@ -322,12 +370,13 @@ func (p *Producer) Push(data []byte) error {
     defer p.pushMu.Unlock()
 
     for attempt := 1; ; attempt++ {
-        if !p.isConnected {
+        if !p.connected() {
             return errNotConnected
         }
 
         // 清掉上一次超时重发遗留的陈旧确认
-        p.drainConfirms()
+        confirmCh := p.confirmChan()
+        p.drainConfirms(confirmCh)
 
         tag, err := p.publish(data)
         if err != nil {
@@ -339,7 +388,7 @@ func (p *Producer) Push(data []byte) error {
             continue
         }
 
-        acked, ok := p.waitConfirm(tag, resendDelay)
+        acked, ok := p.waitConfirm(confirmCh, tag, resendDelay)
         switch {
         case ok && acked:
             return nil
@@ -357,13 +406,13 @@ func (p *Producer) Push(data []byte) error {
 
 // waitConfirm 等待与 tag 匹配的确认。返回 (是否 Ack, 是否收到确认)。
 // 未匹配的确认（陈旧 tag）直接丢弃，不参与本次判定。
-func (p *Producer) waitConfirm(tag uint64, timeout time.Duration) (acked bool, got bool) {
+func (p *Producer) waitConfirm(confirmCh chan amqp.Confirmation, tag uint64, timeout time.Duration) (acked bool, got bool) {
     timer := time.NewTimer(timeout)
     defer timer.Stop()
 
     for {
         select {
-        case confirm, ok := <-p.notifyConfirm:
+        case confirm, ok := <-confirmCh:
             if !ok {
                 return false, false
             }
@@ -380,10 +429,10 @@ func (p *Producer) waitConfirm(tag uint64, timeout time.Duration) (acked bool, g
 }
 
 // drainConfirms 非阻塞排空确认通道，防止陈旧确认占用缓冲/阻塞连接分发。
-func (p *Producer) drainConfirms() {
+func (p *Producer) drainConfirms(confirmCh chan amqp.Confirmation) {
     for {
         select {
-        case _, ok := <-p.notifyConfirm:
+        case _, ok := <-confirmCh:
             if !ok {
                 return
             }
@@ -395,7 +444,7 @@ func (p *Producer) drainConfirms() {
 
 // publish 在持 pushMu 的前提下发布并返回本次消息的 delivery tag。
 func (p *Producer) publish(data []byte) (uint64, error) {
-    ch := p.channel
+    ch := p.currentChannel()
     if ch == nil {
         return 0, errNotConnected
     }
@@ -427,7 +476,7 @@ func (p *Producer) publish(data []byte) (uint64, error) {
 // No guarantees are provided for whether the server will
 // recieve the message.
 func (p *Producer) UnsafePush(data []byte) error {
-    if !p.isConnected {
+    if !p.connected() {
         return errNotConnected
     }
 
@@ -440,18 +489,23 @@ func (p *Producer) UnsafePush(data []byte) error {
 
 // Close will cleanly shutdown the channel and connection.
 func (p *Producer) Close() error {
-    if !p.isConnected {
+    if !p.connected() {
         return errAlreadyClosed
     }
-    err := p.channel.Close()
-    if err != nil {
-        return err
+
+    if ch := p.currentChannel(); ch != nil {
+        if err := ch.Close(); err != nil {
+            return err
+        }
     }
-    err = p.connection.Close()
-    if err != nil {
-        return err
+
+    if conn := p.currentConnection(); conn != nil {
+        if err := conn.Close(); err != nil {
+            return err
+        }
     }
+
     close(p.done)
-    p.isConnected = false
+    p.setConnected(false)
     return nil
 }
