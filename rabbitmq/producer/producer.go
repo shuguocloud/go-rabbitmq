@@ -295,6 +295,17 @@ func (p *Producer) currentChannel() *amqp.Channel {
     return p.channel
 }
 
+// channelSnapshot 在同一 stateMu 读临界区内返回当前 channel 及其绑定的
+// confirm/return 通知通道（Audit 057）。三者必须同属一代连接：换连时
+// tagGen 归零、新 channel 的 DeliveryTag 从 1 重计，若"发布所用 channel"
+// 与"确认监听通道"跨代，旧通道内缓冲的陈旧确认会与新 tag 撞号，
+// 造成"假成功丢消息"。
+func (p *Producer) channelSnapshot() (*amqp.Channel, chan amqp.Confirmation, chan amqp.Return) {
+    p.stateMu.RLock()
+    defer p.stateMu.RUnlock()
+    return p.channel, p.notifyConfirm, p.notifyReturn
+}
+
 func (p *Producer) connCloseChan() chan *amqp.Error {
     p.stateMu.RLock()
     defer p.stateMu.RUnlock()
@@ -305,18 +316,6 @@ func (p *Producer) chanCloseChan() chan *amqp.Error {
     p.stateMu.RLock()
     defer p.stateMu.RUnlock()
     return p.notifyChanClose
-}
-
-func (p *Producer) confirmChan() chan amqp.Confirmation {
-    p.stateMu.RLock()
-    defer p.stateMu.RUnlock()
-    return p.notifyConfirm
-}
-
-func (p *Producer) returnChan() chan amqp.Return {
-    p.stateMu.RLock()
-    defer p.stateMu.RUnlock()
-    return p.notifyReturn
 }
 
 // handleReconnect will wait for a connection error on
@@ -592,17 +591,35 @@ func (p *Producer) PushWithContext(ctx context.Context, data []byte) error {
             return errNotConnected
         }
 
+        // Audit 057：channel 与其 confirm/return 通知通道取自同一 stateMu 读
+        // 临界区，保证本次发布与确认监听同属一代连接，杜绝跨代 tag 撞号假成功。
+        ch, confirmCh, returnCh := p.channelSnapshot()
+        if ch == nil {
+            return errNotConnected
+        }
+
         // 清掉上一次超时重发遗留的陈旧确认与 basic.return（Audit 048）
-        confirmCh := p.confirmChan()
         p.drainConfirms(confirmCh)
-        returnCh := p.returnChan()
         p.drainReturns(returnCh)
 
-        tag, err := p.publish(data, true)
+        tag, err := p.publishOn(ch, data, true)
         if err != nil {
             p.logger.Errorf("[go-rabbitmq] Push failed [err=%s]. Retrying...", err.Error())
             if attempt >= resendTimes {
                 return err
+            }
+            if !sleepWithContext(ctx, reconnectDelay) {
+                return ctx.Err()
+            }
+            continue
+        }
+
+        // Audit 057：publish 后连接已进入重连（快照过期），旧 channel 的确认
+        // 通道随时会被 shutdown 关闭，空等只会白耗 resendDelay，直接走重试。
+        if !p.connected() {
+            p.logger.Errorf("[go-rabbitmq] Push published on a stale channel (reconnecting). Retrying...")
+            if attempt >= resendTimes {
+                return errPushException
             }
             if !sleepWithContext(ctx, reconnectDelay) {
                 return ctx.Err()
@@ -710,14 +727,11 @@ func (p *Producer) drainReturns(returnCh chan amqp.Return) {
     }
 }
 
-// publish 在持 pushMu 的前提下发布并返回本次消息的 delivery tag。
+// publishOn 在持 pushMu 的前提下向 channelSnapshot 取得的 channel 发布，
+// 并返回本次消息的 delivery tag。ch 必须与 waitConfirm 监听的 confirm/return
+// 通道同属一代连接（Audit 057），否则确认归属不可信。
 // mandatory 为 true 时，broker 无法路由会将消息 basic.return 回来（Audit 048）。
-func (p *Producer) publish(data []byte, mandatory bool) (uint64, error) {
-    ch := p.currentChannel()
-    if ch == nil {
-        return 0, errNotConnected
-    }
-
+func (p *Producer) publishOn(ch *amqp.Channel, data []byte, mandatory bool) (uint64, error) {
     if err := ch.Publish(
         p.exchange,  // Exchange
         p.routerKey, // Routing key
@@ -754,7 +768,13 @@ func (p *Producer) UnsafePush(data []byte) error {
     p.pushMu.Lock()
     defer p.pushMu.Unlock()
 
-    _, err := p.publish(data, false)
+    // Audit 057：与 Push 同规——发布必须落在 snapshot 取出的当前代 channel 上。
+    ch, _, _ := p.channelSnapshot()
+    if ch == nil {
+        return errNotConnected
+    }
+
+    _, err := p.publishOn(ch, data, false)
     return err
 }
 
