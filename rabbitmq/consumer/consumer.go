@@ -146,6 +146,12 @@ func New(addr, consumerTag, exchange, exchangeType, queue, routerKey string, han
 // 首次连接rabbitmq，有错即返回
 // 沒有遇錯，则开启goroutine循环检查是否断线
 func (c *Consumer) Start() error {
+    // Audit 054：Close 之后不允许再 Start——startOnce 已消耗时二次调用会返回
+    // 陈旧的 startErr（首次成功时为 nil），把"无法重启"静默伪装成"启动成功"。
+    if c.isClosing() {
+        return errAlreadyClosed
+    }
+
     // Audit 044：Start 幂等，重复调用不会叠加多个 reconnect 协程。
     c.startOnce.Do(func() {
         if c.isClosing() {
