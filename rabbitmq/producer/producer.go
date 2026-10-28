@@ -1,6 +1,7 @@
 package producer
 
 import (
+    "context"
     "errors"
     "log"
     "os"
@@ -158,6 +159,11 @@ func (p *Producer) setConnected(v bool) {
 
 // WaitReady 等待连接就绪，最长 timeout；就绪返回 true，期间 Close 或超时返回 false。
 func (p *Producer) WaitReady(timeout time.Duration) bool {
+    return p.waitReady(context.Background(), timeout)
+}
+
+// waitReady 与 WaitReady 相同，额外响应 ctx 取消（Audit 047）。
+func (p *Producer) waitReady(ctx context.Context, timeout time.Duration) bool {
     p.stateMu.RLock()
     if p.isConnected {
         p.stateMu.RUnlock()
@@ -177,6 +183,8 @@ func (p *Producer) WaitReady(timeout time.Duration) bool {
     case <-ready:
         return true
     case <-p.done:
+        return false
+    case <-ctx.Done():
         return false
     case <-timer.C:
         return false
@@ -459,9 +467,23 @@ func (p *Producer) changeChannel(channel *amqp.Channel) {
 // 若超时未确认则重发，最多 resendTimes 次；仅当收到与本次发布 DeliveryTag
 // 匹配的 Ack 才视为成功，避免陈旧确认导致的"假成功丢消息"。
 func (p *Producer) Push(data []byte) error {
+    return p.PushWithContext(context.Background(), data)
+}
+
+// PushWithContext 与 Push 语义一致，但受 ctx 约束（Audit 047）：建连等待、
+// 重试等待与确认等待都会在 ctx 结束时提前返回 ctx.Err()，避免 broker 故障时
+// 把调用方（含 asynctask 队列满时的内联执行路径）阻塞到 RPC 超时。
+func (p *Producer) PushWithContext(ctx context.Context, data []byte) error {
+    if err := ctx.Err(); err != nil {
+        return err
+    }
+
     // Audit 039：New 为异步建连，启动/断线窗口内直接返回 errNotConnected 会丢消息；
     // 此处先等待就绪（上限 pushReadyTimeout），仍不就绪才失败。
-    if !p.connected() && !p.WaitReady(pushReadyTimeout) {
+    if !p.connected() && !p.waitReady(ctx, pushReadyTimeout) {
+        if err := ctx.Err(); err != nil {
+            return err
+        }
         return errNotConnected
     }
 
@@ -484,11 +506,13 @@ func (p *Producer) Push(data []byte) error {
             if attempt >= resendTimes {
                 return err
             }
-            time.Sleep(reconnectDelay)
+            if !sleepWithContext(ctx, reconnectDelay) {
+                return ctx.Err()
+            }
             continue
         }
 
-        acked, ok := p.waitConfirm(confirmCh, tag, resendDelay)
+        acked, ok := p.waitConfirm(ctx, confirmCh, tag, resendDelay)
         switch {
         case ok && acked:
             return nil
@@ -498,15 +522,31 @@ func (p *Producer) Push(data []byte) error {
             p.logger.Println("[go-rabbitmq] Push nacked by broker. Retrying...")
         }
 
+        if err := ctx.Err(); err != nil {
+            return err
+        }
         if attempt >= resendTimes {
             return errPushException
         }
     }
 }
 
+// sleepWithContext 等待 d，ctx 结束时返回 false（Audit 047）。
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+    timer := time.NewTimer(d)
+    defer timer.Stop()
+
+    select {
+    case <-timer.C:
+        return true
+    case <-ctx.Done():
+        return false
+    }
+}
+
 // waitConfirm 等待与 tag 匹配的确认。返回 (是否 Ack, 是否收到确认)。
-// 未匹配的确认（陈旧 tag）直接丢弃，不参与本次判定。
-func (p *Producer) waitConfirm(confirmCh chan amqp.Confirmation, tag uint64, timeout time.Duration) (acked bool, got bool) {
+// 未匹配的确认（陈旧 tag）直接丢弃，不参与本次判定；ctx 结束立即返回（Audit 047）。
+func (p *Producer) waitConfirm(ctx context.Context, confirmCh chan amqp.Confirmation, tag uint64, timeout time.Duration) (acked bool, got bool) {
     timer := time.NewTimer(timeout)
     defer timer.Stop()
 
@@ -523,6 +563,8 @@ func (p *Producer) waitConfirm(confirmCh chan amqp.Confirmation, tag uint64, tim
         case <-timer.C:
             return false, false
         case <-p.done:
+            return false, false
+        case <-ctx.Done():
             return false, false
         }
     }
