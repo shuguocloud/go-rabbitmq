@@ -2,4 +2,4 @@ module github.com/shuguocloud/go-rabbitmq
 
 go 1.14
 
-require github.com/streadway/amqp v1.1.0
+require github.com/rabbitmq/amqp091-go v1.10.0

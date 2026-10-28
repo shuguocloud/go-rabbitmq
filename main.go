@@ -6,7 +6,7 @@ import (
 
     "github.com/shuguocloud/go-rabbitmq/rabbitmq/consumer"
     "github.com/shuguocloud/go-rabbitmq/rabbitmq/producer"
-    "github.com/streadway/amqp"
+    amqp "github.com/rabbitmq/amqp091-go"
 )
 
 func main() {
