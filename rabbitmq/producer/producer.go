@@ -17,6 +17,7 @@ type Producer struct {
     notifyConnClose chan *amqp.Error       // 如果连接异常关闭，会接受数据
     notifyChanClose chan *amqp.Error       // 如果管道异常关闭，会接受数据
     notifyConfirm   chan amqp.Confirmation // 消息发送成功确认，会接受到数据
+    notifyReturn    chan amqp.Return       // Audit 048：不可路由消息的 basic.return 通知
     done            chan bool              // 如果主动close，会接受数据
     isConnected     bool
 
@@ -129,6 +130,8 @@ var (
     errNotConnected  = errors.New("not connected to a server")
     errAlreadyClosed = errors.New("already closed: not connected to the server")
     errPushException = errors.New("already closed: push exceptionally")
+    // Audit 048：broker 确认收到但无法路由（无匹配绑定），消息实际未进入任何队列。
+    errUnroutable = errors.New("message unroutable: no queue bound to the exchange/routing key")
 )
 
 // IsAlreadyClosed 报告 err 是否表示"该 producer 已被关闭过"。
@@ -308,6 +311,12 @@ func (p *Producer) confirmChan() chan amqp.Confirmation {
     p.stateMu.RLock()
     defer p.stateMu.RUnlock()
     return p.notifyConfirm
+}
+
+func (p *Producer) returnChan() chan amqp.Return {
+    p.stateMu.RLock()
+    defer p.stateMu.RUnlock()
+    return p.notifyReturn
 }
 
 // handleReconnect will wait for a connection error on
@@ -534,16 +543,20 @@ func (p *Producer) changeChannel(channel *amqp.Channel) {
     // Audit 046：带缓冲，保证 Channel.shutdown 同步投递不会卡住 connection reader。
     notifyChanClose := make(chan *amqp.Error, notifyBufferSize)
     notifyConfirm := make(chan amqp.Confirmation, confirmBufferSize)
+    // Audit 048：basic.return 由连接 reader goroutine 同步投递，同样需要缓冲。
+    notifyReturn := make(chan amqp.Return, confirmBufferSize)
 
     p.stateMu.Lock()
     p.tagGen = 0 // 新 channel 的 delivery tag 从 1 重新计数
     p.channel = channel
     p.notifyChanClose = notifyChanClose
     p.notifyConfirm = notifyConfirm
+    p.notifyReturn = notifyReturn
     p.stateMu.Unlock()
 
     channel.NotifyClose(notifyChanClose)
     channel.NotifyPublish(notifyConfirm)
+    channel.NotifyReturn(notifyReturn)
 }
 
 // Push will push data onto the queue, and wait for confirm.
@@ -579,11 +592,13 @@ func (p *Producer) PushWithContext(ctx context.Context, data []byte) error {
             return errNotConnected
         }
 
-        // 清掉上一次超时重发遗留的陈旧确认
+        // 清掉上一次超时重发遗留的陈旧确认与 basic.return（Audit 048）
         confirmCh := p.confirmChan()
         p.drainConfirms(confirmCh)
+        returnCh := p.returnChan()
+        p.drainReturns(returnCh)
 
-        tag, err := p.publish(data)
+        tag, err := p.publish(data, true)
         if err != nil {
             p.logger.Errorf("[go-rabbitmq] Push failed [err=%s]. Retrying...", err.Error())
             if attempt >= resendTimes {
@@ -595,7 +610,13 @@ func (p *Producer) PushWithContext(ctx context.Context, data []byte) error {
             continue
         }
 
-        acked, ok := p.waitConfirm(ctx, confirmCh, tag, resendDelay)
+        acked, ok, returned := p.waitConfirm(ctx, confirmCh, returnCh, tag, resendDelay)
+        if returned != nil {
+            // Audit 048：broker 已确认收到，但 basic.return 表明消息不可路由——
+            // 此时 ack 不代表入队，重发也不会成功，直接返回明确错误。
+            return errUnroutable
+        }
+
         switch {
         case ok && acked:
             return nil
@@ -627,9 +648,10 @@ func sleepWithContext(ctx context.Context, d time.Duration) bool {
     }
 }
 
-// waitConfirm 等待与 tag 匹配的确认。返回 (是否 Ack, 是否收到确认)。
+// waitConfirm 等待与 tag 匹配的确认，同时监听 basic.return（Audit 048）。
+// 返回 (是否 Ack, 是否收到确认, 不可路由的 return 通知)。
 // 未匹配的确认（陈旧 tag）直接丢弃，不参与本次判定；ctx 结束立即返回（Audit 047）。
-func (p *Producer) waitConfirm(ctx context.Context, confirmCh chan amqp.Confirmation, tag uint64, timeout time.Duration) (acked bool, got bool) {
+func (p *Producer) waitConfirm(ctx context.Context, confirmCh chan amqp.Confirmation, returnCh chan amqp.Return, tag uint64, timeout time.Duration) (acked bool, got bool, returned *amqp.Return) {
     timer := time.NewTimer(timeout)
     defer timer.Stop()
 
@@ -637,18 +659,25 @@ func (p *Producer) waitConfirm(ctx context.Context, confirmCh chan amqp.Confirma
         select {
         case confirm, ok := <-confirmCh:
             if !ok {
-                return false, false
+                return false, false, nil
             }
             if confirm.DeliveryTag != tag {
                 continue
             }
-            return confirm.Ack, true
+            return confirm.Ack, true, nil
+        case ret, ok := <-returnCh:
+            if !ok {
+                // channel 已关闭，停止监听 return，仅等待确认结果
+                returnCh = nil
+                continue
+            }
+            return false, false, &ret
         case <-timer.C:
-            return false, false
+            return false, false, nil
         case <-p.done:
-            return false, false
+            return false, false, nil
         case <-ctx.Done():
-            return false, false
+            return false, false, nil
         }
     }
 }
@@ -667,8 +696,23 @@ func (p *Producer) drainConfirms(confirmCh chan amqp.Confirmation) {
     }
 }
 
+// drainReturns 非阻塞排空 basic.return 通道（Audit 048），避免陈旧 return 误判本次发送。
+func (p *Producer) drainReturns(returnCh chan amqp.Return) {
+    for {
+        select {
+        case _, ok := <-returnCh:
+            if !ok {
+                return
+            }
+        default:
+            return
+        }
+    }
+}
+
 // publish 在持 pushMu 的前提下发布并返回本次消息的 delivery tag。
-func (p *Producer) publish(data []byte) (uint64, error) {
+// mandatory 为 true 时，broker 无法路由会将消息 basic.return 回来（Audit 048）。
+func (p *Producer) publish(data []byte, mandatory bool) (uint64, error) {
     ch := p.currentChannel()
     if ch == nil {
         return 0, errNotConnected
@@ -677,7 +721,7 @@ func (p *Producer) publish(data []byte) (uint64, error) {
     if err := ch.Publish(
         p.exchange,  // Exchange
         p.routerKey, // Routing key
-        false,       // Mandatory
+        mandatory,   // Mandatory
         false,       // Immediate
         amqp.Publishing{
             Headers:         p.headers,
@@ -700,6 +744,8 @@ func (p *Producer) publish(data []byte) (uint64, error) {
 // confirmation. It returns an error if it fails to connect.
 // No guarantees are provided for whether the server will
 // recieve the message.
+// Audit 048：此处保持 Mandatory=false——不等待确认的路径没有 basic.return 接收者，
+// 开启 mandatory 只会让 return 通知在通道里堆积。
 func (p *Producer) UnsafePush(data []byte) error {
     if !p.connected() {
         return errNotConnected
@@ -708,7 +754,7 @@ func (p *Producer) UnsafePush(data []byte) error {
     p.pushMu.Lock()
     defer p.pushMu.Unlock()
 
-    _, err := p.publish(data)
+    _, err := p.publish(data, false)
     return err
 }
 
