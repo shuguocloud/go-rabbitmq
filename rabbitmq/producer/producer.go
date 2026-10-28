@@ -95,9 +95,16 @@ const (
 var (
     errNotConnected  = errors.New("not connected to a server")
     errAlreadyClosed = errors.New("already closed: not connected to the server")
-    errShutdown      = errors.New("session is shutting down")
     errPushException = errors.New("already closed: push exceptionally")
 )
+
+// IsAlreadyClosed 报告 err 是否表示"该 producer 已被关闭过"。
+// Audit 051：Close 幂等（Audit 033），重复调用返回 errAlreadyClosed 属正常语义，
+// 调用方（如 pkg/mq 的懒重建与退出钩子）据此区分"重复关闭"与真实关闭失败，
+// 避免幂等路径刷 Error 日志误导排障。
+func IsAlreadyClosed(err error) bool {
+    return errors.Is(err, errAlreadyClosed)
+}
 
 // New creates a new consumer state instance, and automatically
 // attempts to connect to the server.
@@ -318,13 +325,17 @@ func (p *Producer) handleReInit(conn *amqp.Connection) bool {
 
         err := p.init(conn)
         if err != nil {
-            p.logger.Println("[go-rabbitmq] Failed to initialize channel. Retrying...")
+            // Audit 051：init 失败原因与该连接是否已关闭是两回事，分开记录，
+            // 避免把 init 错误当成"连接关闭原因"误导排障。
+            p.logger.Printf("[go-rabbitmq] Failed to initialize channel [err=%s]. Retrying...", err.Error())
 
             select {
             case <-p.done:
                 return true
-            case <-p.connCloseChan():
-                p.logger.Printf("[go-rabbitmq] Connection closed [err=%s]. Reconnecting...", err.Error())
+            case e := <-p.connCloseChan():
+                if e != nil {
+                    p.logger.Printf("[go-rabbitmq] Connection closed [err=%s]. Reconnecting...", e.Error())
+                }
                 return false
             case <-time.After(reInitDelay):
             }
