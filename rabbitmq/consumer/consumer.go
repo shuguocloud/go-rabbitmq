@@ -23,8 +23,13 @@ const (
     // unlimited prefetch，消费慢于生产时消息会无界堆积在进程内直至 OOM。
     defaultPrefetchCount = 50
 
-    // Audit 037：Close 等待消费协程退出的上限，避免拖住进程退出。
-    handleWaitTimeout = 5 * time.Second
+    // Audit 045：NotifyClose 通道缓冲。streadway 的 shutdown 在持有
+    // connection/channel 互斥锁的情况下向监听通道同步投递错误，
+    // 无缓冲且无人接收时会阻塞整个关闭流程（死连接不释放）。
+    notifyBufferSize = 1
+
+    // Audit 043：Close 等待后台重连/消费协程退出的上限，避免拖住进程退出。
+    backgroundWaitTimeout = 5 * time.Second
 )
 
 var (
@@ -62,13 +67,18 @@ func WithLogger(logger *log.Logger) Option {
 }
 
 type Consumer struct {
+    // Audit 042：conn/channel/notify/isConnected/isConsume 会被重连协程、
+    // 消费协程与调用方并发读写，统一由 mu 保护。mu 为叶子锁，
+    // 持锁期间不调用任何 amqp 方法（那些调用可能阻塞）。
+    mu            sync.RWMutex
     conn          *amqp.Connection
     channel       *amqp.Channel
     connNotify    chan *amqp.Error
     channelNotify chan *amqp.Error
-    done          chan struct{}
     isConnected   bool
     isConsume     bool
+
+    done chan struct{}
 
     // consumer dial config
     addr         string
@@ -93,13 +103,15 @@ type Consumer struct {
     // Audit 035：handler 失败/panic 时是否 requeue
     requeueOnFailure bool
 
-    // Audit 037：生命周期。closing 保证 Close 幂等且重连循环能感知退出；
-    // doneOnce 保护 close(done)；handleWg 跟踪消费协程，Close 时等待其退出。
-    closing   int32
-    doneOnce  sync.Once
-    startOnce sync.Once
-    startErr  error
-    handleWg  sync.WaitGroup
+    // Audit 037/043：生命周期。closing 保证 Close 幂等且重连循环能感知退出；
+    // doneOnce 保护 close(done)；reconnectWg/handleWg 分别跟踪重连与消费协程，
+    // Close 时按"先重连后消费"的顺序有界等待。
+    closing     int32
+    doneOnce    sync.Once
+    startOnce   sync.Once
+    startErr    error
+    reconnectWg sync.WaitGroup
+    handleWg    sync.WaitGroup
 
     logger *log.Logger
 }
@@ -141,6 +153,7 @@ func (c *Consumer) Start() error {
             c.startErr = err
             return
         }
+        c.reconnectWg.Add(1)
         go c.reconnect()
     })
 
@@ -149,11 +162,66 @@ func (c *Consumer) Start() error {
 
 // 判断连接是否断开
 func (c *Consumer) IsClosed() bool {
-    if c.conn == nil || c.conn.IsClosed() {
+    conn := c.currentConnection()
+    if conn == nil || conn.IsClosed() {
         c.logger.Println("[go-rabbitmq] rabbitmq has closed!")
         return true
     }
     return false
+}
+
+// 状态访问器：统一封装 conn/channel/notify/isConnected/isConsume（Audit 042）。
+func (c *Consumer) currentConnection() *amqp.Connection {
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+    return c.conn
+}
+
+func (c *Consumer) currentChannel() *amqp.Channel {
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+    return c.channel
+}
+
+func (c *Consumer) notifyChans() (chan *amqp.Error, chan *amqp.Error) {
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+    return c.connNotify, c.channelNotify
+}
+
+func (c *Consumer) connected() bool {
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+    return c.isConnected
+}
+
+func (c *Consumer) setConnected(v bool) {
+    c.mu.Lock()
+    c.isConnected = v
+    c.mu.Unlock()
+}
+
+func (c *Consumer) consuming() bool {
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+    return c.isConsume
+}
+
+func (c *Consumer) setConsuming(v bool) {
+    c.mu.Lock()
+    c.isConsume = v
+    c.mu.Unlock()
+}
+
+// applyConnection 在连接、channel、通知通道全部就绪后一次性提交状态。
+func (c *Consumer) applyConnection(conn *amqp.Connection, ch *amqp.Channel, connNotify, channelNotify chan *amqp.Error) {
+    c.mu.Lock()
+    c.conn = conn
+    c.channel = ch
+    c.connNotify = connNotify
+    c.channelNotify = channelNotify
+    c.isConnected = true
+    c.mu.Unlock()
 }
 
 func (c *Consumer) setHeartBeat(heartbeat int64) time.Duration {
@@ -203,11 +271,18 @@ func (c *Consumer) connect() (err error) {
         return err
     }
 
-    c.conn = conn
-    c.channel = ch
-    c.connNotify = conn.NotifyClose(make(chan *amqp.Error))
-    c.channelNotify = ch.NotifyClose(make(chan *amqp.Error))
-    c.isConnected = true
+    connNotify := conn.NotifyClose(make(chan *amqp.Error, notifyBufferSize))
+    channelNotify := ch.NotifyClose(make(chan *amqp.Error, notifyBufferSize))
+    c.applyConnection(conn, ch, connNotify, channelNotify)
+
+    // Audit 044：提交后再次确认关闭状态，避免 Close 与本函数交错留下无主连接。
+    if c.isClosing() {
+        ch.Close()
+        conn.Close()
+        c.setConnected(false)
+        return errAlreadyClosed
+    }
+
     c.logger.Println("[go-rabbitmq] rabbitmq is connected.")
 
     return nil
@@ -303,15 +378,19 @@ func (c *Consumer) passiveBinding(ch *amqp.Channel) (err error) {
 // 重新连接rabbitmq，并且重新consume
 // 如果连接rabbitmq失败，会一直重试直到成功
 func (c *Consumer) reconnect() {
+    defer c.reconnectWg.Done()
+
     for {
+        connNotify, channelNotify := c.notifyChans()
+
         select {
         case <-c.done:
             return
-        case err := <-c.connNotify:
+        case err := <-connNotify:
             if err != nil {
                 c.logger.Printf("[go-rabbitmq] rabbitmq consumer - connect notify close err=[%s]!", err.Error())
             }
-        case err := <-c.channelNotify:
+        case err := <-channelNotify:
             if err != nil {
                 c.logger.Printf("[go-rabbitmq] rabbitmq consumer - channel notify close err=[%s]!", err.Error())
             }
@@ -322,42 +401,22 @@ func (c *Consumer) reconnect() {
             return
         }
 
-        if c.conn != nil && !c.conn.IsClosed() {
-            // 关闭 SubMsg common delivery
-            if err := c.channel.Cancel(c.consumerTag, true); err != nil {
-                c.logger.Println("[go-rabbitmq] rabbitmq consumer - channel cancel failed: ", err.Error())
-            }
-            if err := c.channel.Close(); err != nil {
-                c.logger.Println("[go-rabbitmq] rabbitmq consumer - channel close failed: ", err.Error())
-            }
-            if err := c.conn.Close(); err != nil {
-                c.logger.Println("[go-rabbitmq] rabbitmq consumer - connection close failed: ", err.Error())
-            }
-        }
+        c.closeStale()
+        // Audit 045：通知通道已改为带缓冲且此处非阻塞排空，避免 shutdown
+        // 同步投递时因无人接收而阻塞，导致死连接无法释放。
+        c.drainNotify(channelNotify, "channel")
+        c.drainNotify(connNotify, "connect")
 
-        // IMPORTANT: 必须清空 Notify，否则死连接不会释放
-        // Audit 037：残留的内置 println 已改为 logger 并打印错误内容。
-        for err := range c.channelNotify {
-            if err != nil {
-                c.logger.Printf("[go-rabbitmq] rabbitmq consumer - channel notify drained err=[%s].", err.Error())
-            }
-        }
+        c.setConnected(false)
+        c.setConsuming(false)
 
-        for err := range c.connNotify {
-            if err != nil {
-                c.logger.Printf("[go-rabbitmq] rabbitmq consumer - connect notify drained err=[%s].", err.Error())
-            }
-        }
-
-        c.isConnected = false
-        c.isConsume = false
         for {
             // Audit 037：内层重试必须感知 Close，否则 Close 之后消费者会重新上线消费。
             if c.isClosing() {
                 return
             }
 
-            if !c.isConnected {
+            if !c.connected() {
                 if err := c.connect(); err != nil {
                     c.logger.Printf("[go-rabbitmq] failed to connect rabbitmq [err=%s]. Retrying...", err.Error())
                     if !c.sleep(reconnectDelay) {
@@ -367,7 +426,7 @@ func (c *Consumer) reconnect() {
             }
             // 检查目前连线是成功的，并开启Consume
             // 避免连线马上断线的风险
-            if c.isConnected && !c.isConsume {
+            if c.connected() && !c.consuming() {
                 if err := c.Consume(); err != nil {
                     c.logger.Printf("[go-rabbitmq] failed to consume rabbitmq [err=%s]. Retrying...", err.Error())
                     if !c.sleep(reconnectDelay) {
@@ -377,6 +436,50 @@ func (c *Consumer) reconnect() {
                     break
                 }
             }
+        }
+    }
+}
+
+// closeStale 关闭上一轮仍存活的 channel/连接（channel 级异常时连接可能仍存活）。
+func (c *Consumer) closeStale() {
+    conn := c.currentConnection()
+    ch := c.currentChannel()
+
+    if conn == nil || conn.IsClosed() {
+        return
+    }
+
+    if ch != nil {
+        // 关闭 SubMsg common delivery
+        if err := ch.Cancel(c.consumerTag, true); err != nil {
+            c.logger.Println("[go-rabbitmq] rabbitmq consumer - channel cancel failed: ", err.Error())
+        }
+        if err := ch.Close(); err != nil {
+            c.logger.Println("[go-rabbitmq] rabbitmq consumer - channel close failed: ", err.Error())
+        }
+    }
+    if err := conn.Close(); err != nil {
+        c.logger.Println("[go-rabbitmq] rabbitmq consumer - connection close failed: ", err.Error())
+    }
+}
+
+// drainNotify 非阻塞排空通知通道，防止陈旧通知占满缓冲。
+func (c *Consumer) drainNotify(ch chan *amqp.Error, label string) {
+    if ch == nil {
+        return
+    }
+
+    for {
+        select {
+        case err, ok := <-ch:
+            if !ok {
+                return
+            }
+            if err != nil {
+                c.logger.Printf("[go-rabbitmq] rabbitmq consumer - %s notify drained err=[%s].", label, err.Error())
+            }
+        default:
+            return
         }
     }
 }
@@ -401,18 +504,20 @@ func (c *Consumer) Consume() (err error) {
     if c.isClosing() {
         return errAlreadyClosed
     }
-    if c.channel == nil {
+
+    ch := c.currentChannel()
+    if ch == nil {
         return errNotConnected
     }
 
     // Audit 036：开始消费前先设置 QoS，避免 broker 无界推送。
-    if err = c.channel.Qos(c.prefetch, 0, false); err != nil {
+    if err = ch.Qos(c.prefetch, 0, false); err != nil {
         c.logger.Println("[go-rabbitmq] failed to set qos:", err.Error())
         c.dropConnection()
         return err
     }
 
-    delivery, err := c.channel.Consume(
+    delivery, err := ch.Consume(
         c.queue,
         c.consumerTag,
         false,
@@ -429,7 +534,7 @@ func (c *Consumer) Consume() (err error) {
         return err
     }
 
-    c.isConsume = true
+    c.setConsuming(true)
     c.logger.Println("[go-rabbitmq] rabbitmq is consuming.")
     c.handleWg.Add(1)
     go c.handle(delivery)
@@ -438,16 +543,16 @@ func (c *Consumer) Consume() (err error) {
 
 // dropConnection 标记断开并回收当前 conn/channel，交由 reconnect 重建。
 func (c *Consumer) dropConnection() {
-    c.isConnected = false
-    c.isConsume = false
+    c.setConnected(false)
+    c.setConsuming(false)
 
-    if c.channel != nil {
-        if err := c.channel.Close(); err != nil && err != amqp.ErrClosed {
+    if ch := c.currentChannel(); ch != nil {
+        if err := ch.Close(); err != nil && err != amqp.ErrClosed {
             c.logger.Println("[go-rabbitmq] channel close failed: ", err.Error())
         }
     }
-    if c.conn != nil {
-        if err := c.conn.Close(); err != nil && err != amqp.ErrClosed {
+    if conn := c.currentConnection(); conn != nil {
+        if err := conn.Close(); err != nil && err != amqp.ErrClosed {
             c.logger.Println("[go-rabbitmq] connection close failed: ", err.Error())
         }
     }
@@ -505,20 +610,20 @@ func (c *Consumer) Close() error {
     c.closeDone()
 
     var err error
-    if c.channel != nil {
-        if cerr := c.channel.Close(); cerr != nil && cerr != amqp.ErrClosed {
+    if ch := c.currentChannel(); ch != nil {
+        if cerr := ch.Close(); cerr != nil && cerr != amqp.ErrClosed {
             err = cerr
         }
     }
-    if c.conn != nil {
-        if cerr := c.conn.Close(); cerr != nil && cerr != amqp.ErrClosed && err == nil {
+    if conn := c.currentConnection(); conn != nil {
+        if cerr := conn.Close(); cerr != nil && cerr != amqp.ErrClosed && err == nil {
             err = cerr
         }
     }
 
-    c.isConnected = false
-    c.isConsume = false
-    c.waitHandleExit()
+    c.setConnected(false)
+    c.setConsuming(false)
+    c.waitBackgroundExit()
 
     return err
 }
@@ -535,17 +640,20 @@ func (c *Consumer) closeDone() {
     })
 }
 
-// waitHandleExit 等待消费协程退出，最多 handleWaitTimeout。
-func (c *Consumer) waitHandleExit() {
+// waitBackgroundExit 等待后台协程退出，最多 backgroundWaitTimeout。
+// Audit 043：先等重连协程（它可能还会启动消费协程），再等消费协程，
+// 顺序保证 WaitGroup 不会出现"计数归零后并发 Add"的误用。
+func (c *Consumer) waitBackgroundExit() {
     exited := make(chan struct{})
     go func() {
+        c.reconnectWg.Wait()
         c.handleWg.Wait()
         close(exited)
     }()
 
     select {
     case <-exited:
-    case <-time.After(handleWaitTimeout):
-        c.logger.Println("[go-rabbitmq] consumer handler did not exit before timeout.")
+    case <-time.After(backgroundWaitTimeout):
+        c.logger.Println("[go-rabbitmq] consumer background goroutines did not exit before timeout.")
     }
 }
